@@ -1,0 +1,65 @@
+{
+  "name": "dsh-sidebrowser",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "description": "DSH 官方侧边栏浏览器：结构化观察、原生输入、提取与操作后复核。",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src/features.js",
+    "skill",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-cordis-client-runner",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-api-session-controller"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check index.js && node --check client.js && node --check src/features.js",
+    "build": "node scripts/build.mjs"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "happy-dom": "^21.0.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AsakuraAOI/dsh-sidebrowser.git"
+  },
+  "homepage": "https://github.com/AsakuraAOI/dsh-sidebrowser#readme",
+  "bugs": {
+    "url": "https://github.com/AsakuraAOI/dsh-sidebrowser/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness"
+  ]
+}
