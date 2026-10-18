@@ -7,7 +7,7 @@ const reportDir = path.resolve(root, '../reports/dsh-sidebrowser-acceptance')
 mkdirSync(reportDir, { recursive: true })
 const steps = [
   ['build', ['scripts/build.mjs']],
-  ['unit', ['--test', 'tests/browser.test.mjs', 'tests/visual-feedback.test.mjs']],
+  ['unit', ['--test', 'tests/browser.test.mjs', 'tests/visual-feedback.test.mjs', 'tests/debug.test.mjs', 'tests/diagnostics.test.mjs', 'tests/shared-core.test.mjs']],
   ['installed-contracts', ['scripts/check-installed-contracts.mjs']],
   ['electron', ['scripts/electron-smoke.mjs']],
 ]

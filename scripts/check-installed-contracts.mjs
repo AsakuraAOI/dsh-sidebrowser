@@ -34,6 +34,11 @@ try {
     ['browser_snapshot', {}], ['browser_extract', { kind: 'tables' }],
     ['browser_act', { action: 'type', selector: '#name', text: '', inputMode: 'dom' }],
     ['browser_eval', { code: 'Promise.resolve({answer:42})' }],
+    ['browser_dev_debug', { action: 'start' }], ['browser_dev_console', {}], ['browser_dev_network', {}],
+    ['browser_dev_debug', { action: 'stop' }],
+    ['browser_dev_inspect', { selector: '#name' }], ['browser_dev_styles', { selector: '#name' }],
+    ['browser_dev_performance', {}], ['browser_dev_performance', { action: 'stop' }],
+    ['browser_dev_storage', {}], ['browser_dev_watch', { action: 'list' }], ['browser_dev_sources', {}],
   ]
   for (const [name, input] of samples) {
     const tool = host.tools.get(name)

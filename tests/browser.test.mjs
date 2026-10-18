@@ -2,9 +2,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { clientHarness, hostHarness } from './harness.mjs'
 
-test('Host registers ten browser_* tools and an optional workflow skill', () => {
+test('Host registers nineteen browser_* tools and an optional workflow skill', () => {
   const h = hostHarness()
-  assert.equal(h.tools.size, 10)
+  assert.equal(h.tools.size, 19)
   assert.ok([...h.tools.keys()].every(name => name.startsWith('browser_')))
   assert.equal(h.skills[0].name, 'dsh-sidebrowser')
   assert.ok(h.skills[0].content.includes('不等于业务任务成功'))

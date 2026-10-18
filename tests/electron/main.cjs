@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain } = require('electron')
 const http = require('node:http')
 const fs = require('node:fs')
 const path = require('node:path')
+const crypto = require('node:crypto')
 app.setPath('userData', path.join(app.getAppPath(), 'fixture-user-data'))
 app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
 app.commandLine.appendSwitch('disable-renderer-backgrounding')
@@ -32,11 +33,44 @@ ipcMain.handle('fixture-host-capture', async (_event, { name, width }) => {
   return { file, size: image.getSize() }
 })
 app.whenReady().then(async () => {
-  server = http.createServer((_req, res) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(fixture) })
+  server = http.createServer((req, res) => {
+    if (req.url === '/asset.js') { res.writeHead(200, { 'content-type': 'application/javascript' }); res.end('window.externalDiagnostic=17;\n//# sourceMappingURL=/asset.js.map'); return }
+    if (req.url === '/asset.js.map') { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"version":3,"sources":["original.ts"],"mappings":""}'); return }
+    if (req.url === '/events') {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' })
+      res.write('data: sse-default-fixture\n\nevent: detail\ndata: sse-named-fixture\n\n'); return
+    }
+    if (req.url === '/beacon') { req.resume(); res.writeHead(204); res.end(); return }
+    if (req.url.startsWith('/api')) {
+      res.writeHead(req.url.includes('error') ? 503 : 200, { 'content-type': 'application/json', 'x-debug-fixture': 'yes' })
+      res.end(req.url.includes('large') ? JSON.stringify({ text: 'x'.repeat(40000) }) : JSON.stringify({ ok: true, method: req.method })); return
+    }
+    if (req.url.startsWith('/offline')) { req.socket.destroy(); return }
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(fixture)
+  })
+  server.on('upgrade', (req, socket) => {
+    const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n')
+    let buffered = Buffer.alloc(0)
+    socket.on('error', () => {})
+    socket.on('data', chunk => {
+      buffered = Buffer.concat([buffered, chunk])
+      while (buffered.length >= 6) {
+        const op = buffered[0] & 15, length = buffered[1] & 127
+        if (length >= 126) { socket.destroy(); return }
+        if (buffered.length < 6 + length) return
+        const payload = Buffer.alloc(length)
+        for (let i = 0; i < length; i++) payload[i] = buffered[6 + i] ^ buffered[2 + i % 4]
+        buffered = buffered.subarray(6 + length)
+        if (op === 8) { socket.end(Buffer.concat([Buffer.from([0x88, length]), payload])); return }
+        if (op === 1) socket.write(Buffer.concat([Buffer.from([0x81, length]), payload]))
+      }
+    })
+  })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   process.env.DSH_SIDEBROWSER_FIXTURE_URL = 'http://127.0.0.1:' + server.address().port + '/'
   window = new BrowserWindow({ show: false, width: 840, height: 680, webPreferences: { nodeIntegration: true, contextIsolation: false, webviewTag: true, sandbox: false, backgroundThrottling: false } })
-  window.webContents.on('will-attach-webview', (_event, prefs) => Object.assign(prefs, { nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true }))
+  window.webContents.on('will-attach-webview', (_event, prefs) => Object.assign(prefs, { nodeIntegration: false, contextIsolation: true, sandbox: true, webSecurity: true, devTools: false }))
   window.webContents.on('did-attach-webview', (_event, guest) => guest.setBackgroundThrottling(false))
   await window.loadFile(path.join(__dirname, 'index.html'))
 }).catch(error => done({ success: false, error: error.stack }))

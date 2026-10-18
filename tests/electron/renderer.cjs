@@ -29,6 +29,8 @@ view.addEventListener('did-finish-load', async () => {
     assert.ok(first.text.includes('Browser fixture'))
     assert.ok(!JSON.stringify(first).includes('private-fixture-sentinel'))
     assert.equal(first.capabilities.nativeInput, true)
+    const debugAcceptance = await require('./debug.cjs')(call, view, provider)
+    debugAcceptance.pageDiagnostics = await require('./diagnostics.cjs')(call, view)
     const type = await call('act', { action: 'type', selector: '#name', text: 'Mira', inputMode: 'native' })
     assert.equal(type.backend, 'native')
     await call('act', { action: 'type', selector: '#name', text: '', inputMode: 'native' })
@@ -100,7 +102,7 @@ view.addEventListener('did-finish-load', async () => {
     assert.equal(document.querySelectorAll('[data-sidebrowser-feedback]').length, 0)
     provider.dispose()
     assert.equal(document.querySelectorAll('[data-sidebrowser-feedback],[data-sidebrowser-badge]').length, 0)
-    ipcRenderer.send('fixture-done', { success: true, nativeTextBackend: type.backend, events: [...evidence.value.events, ...keys.value], pointerBackend: click.backend, enterSubmitVerified: true, selectionDeletionVerified: true, agentLifecycleGlowVerified: true, screenshot: { width: screenshot.width, height: screenshot.height }, screenshotPng: screenshot.base64, feedbackCaptures, extraction: tables.items[0].rows, guestNodeIntegration: evidence.value.node, crossSessionRefused: true })
+    ipcRenderer.send('fixture-done', { success: true, debugAcceptance, nativeTextBackend: type.backend, events: [...evidence.value.events, ...keys.value], pointerBackend: click.backend, enterSubmitVerified: true, selectionDeletionVerified: true, agentLifecycleGlowVerified: true, screenshot: { width: screenshot.width, height: screenshot.height }, screenshotPng: screenshot.base64, feedbackCaptures, extraction: tables.items[0].rows, guestNodeIntegration: evidence.value.node, crossSessionRefused: true })
   } catch (error) {
     let state
     try { state = await view.executeJavaScript('({value:document.querySelector("#name").value,events:window.events,result:document.querySelector("output").textContent,focused:document.hasFocus(),active:document.activeElement?.id})') } catch {}

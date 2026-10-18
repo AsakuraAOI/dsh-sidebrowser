@@ -1,6 +1,8 @@
 // Embedded beside the reference driver. Host and Client use an explicit result
 // envelope so a page-reported error settles the Inspect request immediately.
 const referenceAct = BrowserDriver.prototype.act
+PAGE_HELPERS.push(pageDiagnosticState, pageInspect, pageStyles, pagePerformance, pageWatch,
+  pageStorage, pageSources, pageDiagnosticDispose, installDebugExtensions, pageDebug)
 
 BrowserDriver.prototype.snapshot = async function (sessionId, input) {
   const deadline = beginCall()
@@ -10,7 +12,7 @@ BrowserDriver.prototype.snapshot = async function (sessionId, input) {
   const result = await this.run(guest, pageSnapshot, [input.maxChars, input.maxElements], budgetLeft(deadline))
   return prune({ tabId, ...result, loading: this.isLoading(guest), failed: isErrorPage(result.url),
     capabilities: { nativeInput: typeof guest.sendInputEvent === 'function', nativeText: typeof guest.insertText === 'function',
-      mainDocument: true, crossOriginFrameDOM: false, networkCapture: false } })
+      mainDocument: true, crossOriginFrameDOM: false, networkCapture: 'opt-in-document-probes', diagnostics: 'browser_dev_*', nativeCDP: false } })
 }
 
 BrowserDriver.prototype.extract = async function (sessionId, input) {
@@ -128,12 +130,16 @@ function buildProvider(ctx, viewport) {
   const driver = new BrowserDriver(ctx, viewport)
   AGENT_VISUALS.get(ctx)?.dispose()
   const feedback = new AgentVisualFeedback(ctx, driver)
+  const debug = new BrowserDebugRecorder(ctx, driver)
   AGENT_VISUALS.set(ctx, feedback)
-  provider.dispose = () => feedback.dispose()
+  provider.dispose = () => { debug.dispose(); feedback.dispose() }
   provider.feedback = feedback
+  provider.debug = debug
   const active = new Set()
   const TAB = { type: 'string' }
   provider.manifest.methods.push(
+    ...DEBUG_TOOLS.map(([_name, name, description, properties]) => ({ name, description,
+      inputSchema: { type: 'object', properties, additionalProperties: false } })),
     { name: 'snapshot', description: 'Read a bounded structured main-document snapshot.', inputSchema: { type: 'object', properties: { tabId: TAB, maxChars: { type: 'number' }, maxElements: { type: 'number' } }, additionalProperties: false } },
     { name: 'extract', description: 'Extract rendered table rows, links, headings or list items.', inputSchema: { type: 'object', properties: { tabId: TAB, kind: { type: 'string', enum: ['links','headings','tables','list'] }, selector: { type: 'string' }, limit: { type: 'number' }, maxChars: { type: 'number' } }, required: ['kind'], additionalProperties: false } },
   )
@@ -156,7 +162,8 @@ function buildProvider(ctx, viewport) {
     active.add(sessionId)
     const visual = feedback.begin(sessionId, method, input || {})
     try {
-      const value = method === 'snapshot' ? await driver.snapshot(sessionId, input || {})
+      const value = DEBUG_TOOLS.some(row => row[1] === method) ? await debug.query(method, sessionId, input || {})
+        : method === 'snapshot' ? await driver.snapshot(sessionId, input || {})
         : method === 'extract' ? await driver.extract(sessionId, input || {}) : await query(method, input, context)
       feedback.finish(visual, value, false)
       return { transportVersion: 1, ok: true, value: prune(value) }

@@ -11,13 +11,16 @@ fs.mkdirSync(path.join(output, 'resources', 'app'), { recursive: true })
 for (const entry of fs.readdirSync(install, { withFileTypes: true })) {
   if (!entry.isFile() || (entry.name.endsWith('.exe') && entry.name !== 'DeepSeek Harness.exe')) continue
   const target = path.join(output, entry.name === 'DeepSeek Harness.exe' ? 'BrowserFixture.exe' : entry.name)
+  // Desktop updates replace binaries. Refresh old fixture hard links so the
+  // acceptance run uses the currently installed Electron, not a previous one.
+  if (fs.existsSync(target) && fs.statSync(target).ino !== fs.statSync(path.join(install, entry.name)).ino) fs.unlinkSync(target)
   if (!fs.existsSync(target)) fs.linkSync(path.join(install, entry.name), target)
 }
 const locales = path.join(output, 'locales')
 if (!fs.existsSync(locales)) fs.symlinkSync(path.join(install, 'locales'), locales, 'junction')
 const app = path.join(output, 'resources', 'app')
 fs.writeFileSync(path.join(app, 'package.json'), JSON.stringify({ name: 'dsh-sidebrowser-fixture', version: '0.0.0', main: 'main.cjs' }))
-for (const name of ['main.cjs', 'renderer.cjs', 'index.html']) fs.copyFileSync(path.join(root, 'tests', 'electron', name), path.join(app, name))
+for (const name of ['main.cjs', 'renderer.cjs', 'debug.cjs', 'diagnostics.cjs', 'index.html']) fs.copyFileSync(path.join(root, 'tests', 'electron', name), path.join(app, name))
 const env = { ...process.env, DSH_SIDEBROWSER_PLUGIN_ROOT: root, DSH_SIDEBROWSER_REPORT: path.join(output, 'result.json') }
 delete env.ELECTRON_RUN_AS_NODE
 const child = spawn(path.join(output, 'BrowserFixture.exe'), [], { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })

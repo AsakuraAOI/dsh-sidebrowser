@@ -56,7 +56,7 @@ export function pageSnapshot(maxChars, maxElements) {
   })
   return {
     ...read, capturedAt: new Date().toISOString(), readyState: document.readyState,
-    viewport: { width: innerWidth, height: innerHeight },
+    viewport: pageViewport(),
     headings: headings.items, links: links.items, elements: controls.elements, frames,
     snapshotId: controls.elements[0]?.ref.split('-e')[0] || '',
     truncated: read.truncated || controls.truncated || headings.truncated || links.truncated,
@@ -68,16 +68,13 @@ export function pagePrepareNative(ref, selector, action) {
   const found = pageResolve(ref, selector)
   if (!found.el) return { ok: false, reason: found.reason }
   const el = found.el
-  if (el.disabled || el.getAttribute('aria-disabled') === 'true') return { ok: false, reason: 'disabled-element' }
+  if (pageElementDisabled(el)) return { ok: false, reason: 'disabled-element' }
   if (!pageVisible(el)) return { ok: false, reason: 'hidden-element' }
   el.scrollIntoView({ block: 'center', inline: 'center' })
-  const rect = el.getBoundingClientRect()
-  const left = Math.max(0, rect.left), top = Math.max(0, rect.top)
-  const right = Math.min(innerWidth, rect.right), bottom = Math.min(innerHeight, rect.bottom)
-  if (right <= left || bottom <= top) return { ok: false, reason: 'outside-viewport' }
-  const x = (left + right) / 2, y = (top + bottom) / 2
-  const hit = document.elementFromPoint(x, y)
-  if (!hit || !(el === hit || el.contains(hit))) return { ok: false, reason: 'covered-element' }
+  const geometry = pageElementGeometry(el)
+  if (!geometry.inViewport) return { ok: false, reason: 'outside-viewport' }
+  const { x, y } = pageTargetPoint(geometry)
+  if (!pageHitTest(el, { x, y }).targetContainsHit) return { ok: false, reason: 'covered-element' }
   if (action === 'type') {
     const tag = el.tagName.toLowerCase()
     if (el.readOnly || !(['input', 'textarea'].includes(tag) || el.isContentEditable)) return { ok: false, reason: 'not-editable' }
@@ -92,12 +89,13 @@ export function pagePrepareNative(ref, selector, action) {
       try { el.select() } catch { return { ok: false, reason: 'selection-unavailable' } }
     }
   } else if (action === 'press') el.focus()
-  return { ok: true, x, y, url: location.href, viewportWidth: innerWidth, viewportHeight: innerHeight }
+  return { ok: true, x, y, url: location.href, viewportWidth: geometry.viewport.width, viewportHeight: geometry.viewport.height }
 }
 
 export function pageCoordinatePoint(x, y) {
-  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) throw new Error('Coordinates must be inside the current page CSS viewport')
-  return { ok: true, x, y, url: location.href, viewportWidth: innerWidth, viewportHeight: innerHeight }
+  const viewport = pageViewport()
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) throw new Error('Coordinates must be inside the current page CSS viewport')
+  return { ok: true, x, y, url: location.href, viewportWidth: viewport.width, viewportHeight: viewport.height }
 }
 
 export function pageVisualTarget(ref, selector) {
@@ -105,6 +103,6 @@ export function pageVisualTarget(ref, selector) {
   const el = found.el
   if (!el || el === document.body || !pageVisible(el)) return null
   el.scrollIntoView({ block: 'center', inline: 'center' })
-  const rect = el.getBoundingClientRect()
-  return { x: Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2)), y: Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2)), viewportWidth: innerWidth, viewportHeight: innerHeight }
+  const geometry = pageElementGeometry(el), point = pageTargetPoint(geometry, 'clamped-center')
+  return { ...point, viewportWidth: geometry.viewport.width, viewportHeight: geometry.viewport.height }
 }

@@ -201,34 +201,7 @@ window.__ModuleLoader__.load({
     // one IIFE so they neither need nor pollute the page's global namespace.
     // -----------------------------------------------------------------------
 
-    /**
-     * Resolve a ref or selector to an element inside the page.
-     * @param ref - ref from a previous elements read.
-     * @param selector - explicit CSS selector.
-     * @returns the element, or a reason it could not be resolved.
-     */
-    function pageResolve(ref, selector) {
-      if (ref) {
-        const store = window.__dshSidebrowserRefs
-        const el = store && store.get ? store.get(ref) : undefined
-        if (!el) return { reason: 'unknown-ref' }
-        if (!el.isConnected) return { reason: 'stale-ref' }
-        return { el }
-      }
-      if (selector) {
-        let el
-        try {
-          const matches = document.querySelectorAll(selector)
-          if (matches.length > 1) return { reason: 'ambiguous-selector' }
-          el = matches[0]
-        } catch (error) {
-          return { reason: 'invalid-selector', detail: String(error && error.message) }
-        }
-        if (!el) return { reason: 'no-match' }
-        return { el }
-      }
-      return { reason: 'missing-target' }
-    }
+    /* PAGE_CORE */
 
     /**
      * Report the page's own identity.
@@ -273,30 +246,6 @@ window.__ModuleLoader__.load({
         html: truncated ? html.slice(0, maxChars) : html,
         truncated,
       }
-    }
-
-    /**
-     * Whether an element is actually being drawn.
-     *
-     * Shared deliberately: `pageReadElements` filters its list by this, and
-     * `pageWaitFor` decides `state: 'visible'` by it. Two copies of this rule
-     * would drift, and the failure mode of drift here is silent — a `wait` that
-     * reports "visible" for an element the element list would have skipped (or
-     * the reverse) is exactly the kind of disagreement that costs a debugging
-     * round. A report already hit the related trap by hand: it counted
-     * `display:none` rows as present and concluded a layout had no overflow.
-     *
-     * Note this is not the same question as "does the selector match": an element
-     * can be attached and invisible, which is why `state` distinguishes them.
-     * @param el - the element to test.
-     * @returns true when the element occupies layout boxes and is not hidden.
-     */
-    function pageVisible(el) {
-      if (el.getClientRects().length === 0) return false
-      const style = window.getComputedStyle(el)
-      if (style.visibility === 'hidden' || style.display === 'none') return false
-      if (style.opacity === '0') return false
-      return true
     }
 
     /**
@@ -349,7 +298,7 @@ window.__ModuleLoader__.load({
         store.set(ref, el)
         const tag = el.tagName.toLowerCase()
         const type = tag === 'input' ? el.getAttribute('type') || 'text' : ''
-        const secret = type === 'password' || /password|secret|token|api.?key|otp|one-time-code/i.test([el.getAttribute('name'), el.getAttribute('autocomplete'), el.getAttribute('id')].join(' '))
+        const secret = pageCredentialElement(el)
         const rawValue = secret ? '[redacted]' : tag === 'input' || tag === 'textarea' || tag === 'select' ? el.value : ''
         out.push({
           ref,
@@ -358,7 +307,7 @@ window.__ModuleLoader__.load({
           text: pageLabelFor(el),
           name: el.getAttribute('name') || '',
           value: typeof rawValue === 'string' ? rawValue.slice(0, 200) : '',
-          disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
+          disabled: pageElementDisabled(el),
         })
       }
       return {
@@ -379,7 +328,7 @@ window.__ModuleLoader__.load({
       const found = pageResolve(ref, selector)
       if (!found.el) return { ok: false, reason: found.reason, detail: found.detail }
       const el = found.el
-      if (el.disabled || el.getAttribute('aria-disabled') === 'true') return { ok: false, reason: 'disabled-element' }
+      if (pageElementDisabled(el)) return { ok: false, reason: 'disabled-element' }
       if (!pageVisible(el)) return { ok: false, reason: 'hidden-element' }
       el.scrollIntoView({ block: 'center', inline: 'center' })
       if (typeof el.focus === 'function') el.focus()
@@ -399,7 +348,7 @@ window.__ModuleLoader__.load({
       const found = pageResolve(ref, selector)
       if (!found.el) return { ok: false, reason: found.reason, detail: found.detail }
       const el = found.el
-      if (el.disabled || el.getAttribute('aria-disabled') === 'true') return { ok: false, reason: 'disabled-element' }
+      if (pageElementDisabled(el)) return { ok: false, reason: 'disabled-element' }
       if (!pageVisible(el)) return { ok: false, reason: 'hidden-element' }
       if (el.readOnly) return { ok: false, reason: 'not-editable' }
       el.scrollIntoView({ block: 'center', inline: 'center' })
@@ -483,7 +432,7 @@ window.__ModuleLoader__.load({
       const found = pageResolve(ref, selector)
       if (!found.el) return { ok: false, reason: found.reason, detail: found.detail }
       const el = found.el
-      if (el.disabled || el.getAttribute('aria-disabled') === 'true') return { ok: false, reason: 'disabled-element' }
+      if (pageElementDisabled(el)) return { ok: false, reason: 'disabled-element' }
       if (!pageVisible(el)) return { ok: false, reason: 'hidden-element' }
       if (el.tagName.toLowerCase() !== 'select') return { ok: false, reason: 'not-a-select' }
       const options = Array.from(el.options)
@@ -576,15 +525,11 @@ window.__ModuleLoader__.load({
           })
         }
         const satisfied = () => {
-          let el
-          try {
-            el = document.querySelector(selector)
-          } catch (error) {
-            // An invalid selector is a caller mistake, not a timeout: report it
-            // as such instead of polling for the full budget and then blaming
-            // the page for not matching.
-            return { invalid: String(error && error.message) }
-          }
+          // Waiting retains first-match semantics; actions/inspection require
+          // a unique target. Both use the same selector/error implementation.
+          const found = pageResolve(null, selector, false)
+          if (found.reason === 'invalid-selector') return { invalid: found.detail }
+          const el = found.el || null
           if (state === 'attached') return { ok: el !== null }
           if (state === 'visible') return { ok: el !== null && pageVisible(el) }
           // 'hidden' is satisfied by absent as well as by invisible: both mean
@@ -623,6 +568,9 @@ window.__ModuleLoader__.load({
      * the interaction helpers, so it must be declared before them.
      */
     const PAGE_HELPERS = [
+      pageClip, pageBoundInt, pageSensitiveName, pageCredentialElement, pageRedactURL,
+      pageElementDisabled, pageElementIdentity, pageElementRect, pageElementDimensions,
+      pageViewport, pageElementGeometry, pageTargetPoint, pageHitTest, pageRendererBox, pageReadResponseText,
       pageResolve,
       pageVisible,
       pageLabelFor,
@@ -973,10 +921,10 @@ window.__ModuleLoader__.load({
 
         const available =
           container.clientWidth ||
-          container.getBoundingClientRect().width ||
-          guest.getBoundingClientRect().width
+          pageElementRect(container).width ||
+          pageElementRect(guest).width
         const availableHeight =
-          container.clientHeight || container.getBoundingClientRect().height
+          container.clientHeight || pageElementRect(container).height
 
         if (target.preset === 'auto') {
           container.style.overflow = ''

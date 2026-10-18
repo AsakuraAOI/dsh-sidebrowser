@@ -201,34 +201,134 @@ window.__ModuleLoader__.load({
     // one IIFE so they neither need nor pollute the page's global namespace.
     // -----------------------------------------------------------------------
 
-    /**
-     * Resolve a ref or selector to an element inside the page.
-     * @param ref - ref from a previous elements read.
-     * @param selector - explicit CSS selector.
-     * @returns the element, or a reason it could not be resolved.
-     */
-    function pageResolve(ref, selector) {
-      if (ref) {
-        const store = window.__dshSidebrowserRefs
-        const el = store && store.get ? store.get(ref) : undefined
-        if (!el) return { reason: 'unknown-ref' }
-        if (!el.isConnected) return { reason: 'stale-ref' }
-        return { el }
+    // Shared primitives for ordinary browser actions and browser_dev diagnostics.
+// Serialized into the guest without allocating a recorder, observer or store.
+function pageClip(value, max = 1000) { return String(value ?? '').slice(0, max) }
+
+function pageBoundInt(value, fallback, max, min = 1) {
+  return Number.isFinite(value) ? Math.max(min, Math.min(max, Math.floor(value))) : fallback
+}
+
+function pageSensitiveName(value) {
+  return /password|passwd|secret|token|authorization|cookie|api[-_]?key/i.test(String(value ?? ''))
+}
+
+function pageCredentialElement(el) {
+  return (el.getAttribute('type') || '').toLowerCase() === 'password'
+    || pageSensitiveName([el.getAttribute('name'), el.getAttribute('autocomplete'), el.getAttribute('id')].join(' '))
+    || /api.?key|otp|one-time-code/i.test([el.getAttribute('name'), el.getAttribute('autocomplete'), el.getAttribute('id')].join(' '))
+}
+
+function pageRedactURL(value, base, stripHash = false) {
+  const url = base === undefined ? new URL(value) : new URL(value, base)
+  url.username = ''; url.password = ''
+  if (stripHash) url.hash = ''
+  for (const name of [...url.searchParams.keys()]) if (pageSensitiveName(name)) url.searchParams.set(name, '[redacted]')
+  return url.href
+}
+
+function pageResolve(ref, selector, unique = true) {
+  if (ref) {
+    const store = window.__dshSidebrowserRefs
+    const el = store && store.get ? store.get(ref) : undefined
+    if (!el) return { reason: 'unknown-ref' }
+    if (!el.isConnected) return { reason: 'stale-ref' }
+    return { el }
+  }
+  if (selector) {
+    try {
+      if (!unique) {
+        const el = document.querySelector(selector)
+        return el ? { el } : { reason: 'no-match' }
       }
-      if (selector) {
-        let el
-        try {
-          const matches = document.querySelectorAll(selector)
-          if (matches.length > 1) return { reason: 'ambiguous-selector' }
-          el = matches[0]
-        } catch (error) {
-          return { reason: 'invalid-selector', detail: String(error && error.message) }
-        }
-        if (!el) return { reason: 'no-match' }
-        return { el }
-      }
-      return { reason: 'missing-target' }
+      const matches = document.querySelectorAll(selector)
+      if (matches.length > 1) return { reason: 'ambiguous-selector' }
+      return matches[0] ? { el: matches[0] } : { reason: 'no-match' }
+    } catch (error) { return { reason: 'invalid-selector', detail: String(error && error.message) } }
+  }
+  return { reason: 'missing-target' }
+}
+
+function pageVisible(el) {
+  if (el.getClientRects().length === 0) return false
+  const style = window.getComputedStyle(el)
+  return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0'
+}
+
+function pageElementDisabled(el) { return !!el.disabled || el.getAttribute('aria-disabled') === 'true' }
+
+function pageElementIdentity(el) {
+  return el?.nodeType === 1 ? { tag: el.localName, id: pageClip(el.id, 120), class: pageClip(el.getAttribute('class'), 200) } : null
+}
+
+function pageElementRect(el) {
+  const rect = el.getBoundingClientRect(), result = {}
+  for (const name of ['x','y','top','left','right','bottom','width','height']) result[name] = Number.isFinite(rect[name]) ? rect[name] : null
+  return result
+}
+
+function pageElementDimensions(el) {
+  return { offsetWidth: el.offsetWidth, offsetHeight: el.offsetHeight, clientWidth: el.clientWidth, clientHeight: el.clientHeight,
+    scrollWidth: el.scrollWidth, scrollHeight: el.scrollHeight }
+}
+
+function pageViewport() { return { width: innerWidth, height: innerHeight } }
+
+function pageElementGeometry(el) {
+  const rect = pageElementRect(el), viewport = pageViewport()
+  const visibleRect = { left: Math.max(0, rect.left), top: Math.max(0, rect.top),
+    right: Math.min(viewport.width, rect.right), bottom: Math.min(viewport.height, rect.bottom) }
+  return { rect, viewport, visibleRect, inViewport: visibleRect.right > visibleRect.left && visibleRect.bottom > visibleRect.top }
+}
+
+function pageTargetPoint(geometry, policy = 'visible-center') {
+  if (policy === 'visible-center') return { x: (geometry.visibleRect.left + geometry.visibleRect.right) / 2,
+    y: (geometry.visibleRect.top + geometry.visibleRect.bottom) / 2 }
+  // Inspection/cursor feedback can describe an offscreen target without
+  // claiming it is clickable. Actions require the visible intersection.
+  return { x: Math.max(0, Math.min(geometry.viewport.width - 1, geometry.rect.left + geometry.rect.width / 2)),
+    y: Math.max(0, Math.min(geometry.viewport.height - 1, geometry.rect.top + geometry.rect.height / 2)) }
+}
+
+function pageHitTest(el, point) {
+  const hit = document.elementFromPoint(point.x, point.y)
+  return { hit, targetContainsHit: !!hit && (el === hit || el.contains(hit)) }
+}
+
+function pageRendererBox(el) {
+  const rect = pageElementRect(el), sizes = pageElementDimensions(el), css = window.getComputedStyle(el)
+  return { rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, clientWidth: sizes.clientWidth, clientHeight: sizes.clientHeight,
+    layoutWidth: sizes.offsetWidth, layoutHeight: sizes.offsetHeight, transform: css.transform, transformOrigin: css.transformOrigin, display: css.display, overflow: css.overflow }
+}
+
+async function pageReadResponseText(response, options = {}) {
+  const maxBytes = pageBoundInt(options.maxBytes, 16384, 16384), timeoutMs = pageBoundInt(options.timeoutMs, 1500, 3000)
+  let reader, timer
+  try {
+    const type = response.headers.get('content-type') || ''
+    if (!/text\/|json|xml|javascript|urlencoded/i.test(type) || /event-stream/i.test(type)) return { unavailable: 'Not a finite textual response' }
+    if (options.isActive && !options.isActive()) return { unavailable: 'Recording stopped' }
+    // Only inspect a clone: the original Response remains consumable by the app.
+    reader = response.clone().body?.getReader()
+    if (!reader) return { text: '', truncated: false }
+    options.readers?.add(reader)
+    const decoder = new TextDecoder(), parts = []; let size = 0
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Text read timed out')), timeoutMs) })
+    while (!options.isActive || options.isActive()) {
+      const { value, done } = await Promise.race([reader.read(), timeout])
+      if (done) return { text: parts.join('') + decoder.decode(), truncated: false }
+      parts.push(decoder.decode(value.subarray(0, maxBytes - size), { stream: true })); size += value.length
+      // Do not flush a partial UTF-8 sequence at a truncated boundary.
+      if (size >= maxBytes) return { text: parts.join(''), truncated: true }
     }
+    return { unavailable: 'Recording stopped' }
+  } catch (error) { return { unavailable: pageClip(error?.message || error, 500) } }
+  finally {
+    clearTimeout(timer)
+    if (reader) { options.readers?.delete(reader); void reader.cancel().catch(() => {}) }
+  }
+}
+
 
     /**
      * Report the page's own identity.
@@ -273,30 +373,6 @@ window.__ModuleLoader__.load({
         html: truncated ? html.slice(0, maxChars) : html,
         truncated,
       }
-    }
-
-    /**
-     * Whether an element is actually being drawn.
-     *
-     * Shared deliberately: `pageReadElements` filters its list by this, and
-     * `pageWaitFor` decides `state: 'visible'` by it. Two copies of this rule
-     * would drift, and the failure mode of drift here is silent — a `wait` that
-     * reports "visible" for an element the element list would have skipped (or
-     * the reverse) is exactly the kind of disagreement that costs a debugging
-     * round. A report already hit the related trap by hand: it counted
-     * `display:none` rows as present and concluded a layout had no overflow.
-     *
-     * Note this is not the same question as "does the selector match": an element
-     * can be attached and invisible, which is why `state` distinguishes them.
-     * @param el - the element to test.
-     * @returns true when the element occupies layout boxes and is not hidden.
-     */
-    function pageVisible(el) {
-      if (el.getClientRects().length === 0) return false
-      const style = window.getComputedStyle(el)
-      if (style.visibility === 'hidden' || style.display === 'none') return false
-      if (style.opacity === '0') return false
-      return true
     }
 
     /**
@@ -349,7 +425,7 @@ window.__ModuleLoader__.load({
         store.set(ref, el)
         const tag = el.tagName.toLowerCase()
         const type = tag === 'input' ? el.getAttribute('type') || 'text' : ''
-        const secret = type === 'password' || /password|secret|token|api.?key|otp|one-time-code/i.test([el.getAttribute('name'), el.getAttribute('autocomplete'), el.getAttribute('id')].join(' '))
+        const secret = pageCredentialElement(el)
         const rawValue = secret ? '[redacted]' : tag === 'input' || tag === 'textarea' || tag === 'select' ? el.value : ''
         out.push({
           ref,
@@ -358,7 +434,7 @@ window.__ModuleLoader__.load({
           text: pageLabelFor(el),
           name: el.getAttribute('name') || '',
           value: typeof rawValue === 'string' ? rawValue.slice(0, 200) : '',
-          disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
+          disabled: pageElementDisabled(el),
         })
       }
       return {
@@ -379,7 +455,7 @@ window.__ModuleLoader__.load({
       const found = pageResolve(ref, selector)
       if (!found.el) return { ok: false, reason: found.reason, detail: found.detail }
       const el = found.el
-      if (el.disabled || el.getAttribute('aria-disabled') === 'true') return { ok: false, reason: 'disabled-element' }
+      if (pageElementDisabled(el)) return { ok: false, reason: 'disabled-element' }
       if (!pageVisible(el)) return { ok: false, reason: 'hidden-element' }
       el.scrollIntoView({ block: 'center', inline: 'center' })
       if (typeof el.focus === 'function') el.focus()
@@ -399,7 +475,7 @@ window.__ModuleLoader__.load({
       const found = pageResolve(ref, selector)
       if (!found.el) return { ok: false, reason: found.reason, detail: found.detail }
       const el = found.el
-      if (el.disabled || el.getAttribute('aria-disabled') === 'true') return { ok: false, reason: 'disabled-element' }
+      if (pageElementDisabled(el)) return { ok: false, reason: 'disabled-element' }
       if (!pageVisible(el)) return { ok: false, reason: 'hidden-element' }
       if (el.readOnly) return { ok: false, reason: 'not-editable' }
       el.scrollIntoView({ block: 'center', inline: 'center' })
@@ -483,7 +559,7 @@ window.__ModuleLoader__.load({
       const found = pageResolve(ref, selector)
       if (!found.el) return { ok: false, reason: found.reason, detail: found.detail }
       const el = found.el
-      if (el.disabled || el.getAttribute('aria-disabled') === 'true') return { ok: false, reason: 'disabled-element' }
+      if (pageElementDisabled(el)) return { ok: false, reason: 'disabled-element' }
       if (!pageVisible(el)) return { ok: false, reason: 'hidden-element' }
       if (el.tagName.toLowerCase() !== 'select') return { ok: false, reason: 'not-a-select' }
       const options = Array.from(el.options)
@@ -576,15 +652,11 @@ window.__ModuleLoader__.load({
           })
         }
         const satisfied = () => {
-          let el
-          try {
-            el = document.querySelector(selector)
-          } catch (error) {
-            // An invalid selector is a caller mistake, not a timeout: report it
-            // as such instead of polling for the full budget and then blaming
-            // the page for not matching.
-            return { invalid: String(error && error.message) }
-          }
+          // Waiting retains first-match semantics; actions/inspection require
+          // a unique target. Both use the same selector/error implementation.
+          const found = pageResolve(null, selector, false)
+          if (found.reason === 'invalid-selector') return { invalid: found.detail }
+          const el = found.el || null
           if (state === 'attached') return { ok: el !== null }
           if (state === 'visible') return { ok: el !== null && pageVisible(el) }
           // 'hidden' is satisfied by absent as well as by invisible: both mean
@@ -623,6 +695,9 @@ window.__ModuleLoader__.load({
      * the interaction helpers, so it must be declared before them.
      */
     const PAGE_HELPERS = [
+      pageClip, pageBoundInt, pageSensitiveName, pageCredentialElement, pageRedactURL,
+      pageElementDisabled, pageElementIdentity, pageElementRect, pageElementDimensions,
+      pageViewport, pageElementGeometry, pageTargetPoint, pageHitTest, pageRendererBox, pageReadResponseText,
       pageResolve,
       pageVisible,
       pageLabelFor,
@@ -742,7 +817,7 @@ function pageSnapshot(maxChars, maxElements) {
   })
   return {
     ...read, capturedAt: new Date().toISOString(), readyState: document.readyState,
-    viewport: { width: innerWidth, height: innerHeight },
+    viewport: pageViewport(),
     headings: headings.items, links: links.items, elements: controls.elements, frames,
     snapshotId: controls.elements[0]?.ref.split('-e')[0] || '',
     truncated: read.truncated || controls.truncated || headings.truncated || links.truncated,
@@ -754,16 +829,13 @@ function pagePrepareNative(ref, selector, action) {
   const found = pageResolve(ref, selector)
   if (!found.el) return { ok: false, reason: found.reason }
   const el = found.el
-  if (el.disabled || el.getAttribute('aria-disabled') === 'true') return { ok: false, reason: 'disabled-element' }
+  if (pageElementDisabled(el)) return { ok: false, reason: 'disabled-element' }
   if (!pageVisible(el)) return { ok: false, reason: 'hidden-element' }
   el.scrollIntoView({ block: 'center', inline: 'center' })
-  const rect = el.getBoundingClientRect()
-  const left = Math.max(0, rect.left), top = Math.max(0, rect.top)
-  const right = Math.min(innerWidth, rect.right), bottom = Math.min(innerHeight, rect.bottom)
-  if (right <= left || bottom <= top) return { ok: false, reason: 'outside-viewport' }
-  const x = (left + right) / 2, y = (top + bottom) / 2
-  const hit = document.elementFromPoint(x, y)
-  if (!hit || !(el === hit || el.contains(hit))) return { ok: false, reason: 'covered-element' }
+  const geometry = pageElementGeometry(el)
+  if (!geometry.inViewport) return { ok: false, reason: 'outside-viewport' }
+  const { x, y } = pageTargetPoint(geometry)
+  if (!pageHitTest(el, { x, y }).targetContainsHit) return { ok: false, reason: 'covered-element' }
   if (action === 'type') {
     const tag = el.tagName.toLowerCase()
     if (el.readOnly || !(['input', 'textarea'].includes(tag) || el.isContentEditable)) return { ok: false, reason: 'not-editable' }
@@ -778,12 +850,13 @@ function pagePrepareNative(ref, selector, action) {
       try { el.select() } catch { return { ok: false, reason: 'selection-unavailable' } }
     }
   } else if (action === 'press') el.focus()
-  return { ok: true, x, y, url: location.href, viewportWidth: innerWidth, viewportHeight: innerHeight }
+  return { ok: true, x, y, url: location.href, viewportWidth: geometry.viewport.width, viewportHeight: geometry.viewport.height }
 }
 
 function pageCoordinatePoint(x, y) {
-  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) throw new Error('Coordinates must be inside the current page CSS viewport')
-  return { ok: true, x, y, url: location.href, viewportWidth: innerWidth, viewportHeight: innerHeight }
+  const viewport = pageViewport()
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) throw new Error('Coordinates must be inside the current page CSS viewport')
+  return { ok: true, x, y, url: location.href, viewportWidth: viewport.width, viewportHeight: viewport.height }
 }
 
 function pageVisualTarget(ref, selector) {
@@ -791,8 +864,8 @@ function pageVisualTarget(ref, selector) {
   const el = found.el
   if (!el || el === document.body || !pageVisible(el)) return null
   el.scrollIntoView({ block: 'center', inline: 'center' })
-  const rect = el.getBoundingClientRect()
-  return { x: Math.max(0, Math.min(innerWidth - 1, rect.left + rect.width / 2)), y: Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2)), viewportWidth: innerWidth, viewportHeight: innerHeight }
+  const geometry = pageElementGeometry(el), point = pageTargetPoint(geometry, 'clamped-center')
+  return { ...point, viewportWidth: geometry.viewport.width, viewportHeight: geometry.viewport.height }
 }
 
 
@@ -1083,10 +1156,10 @@ function pageVisualTarget(ref, selector) {
 
         const available =
           container.clientWidth ||
-          container.getBoundingClientRect().width ||
-          guest.getBoundingClientRect().width
+          pageElementRect(container).width ||
+          pageElementRect(guest).width
         const availableHeight =
-          container.clientHeight || container.getBoundingClientRect().height
+          container.clientHeight || pageElementRect(container).height
 
         if (target.preset === 'auto') {
           container.style.overflow = ''
@@ -2666,9 +2739,1031 @@ class AgentVisualFeedback {
   }
 }
 
+// Helpers are serialized into the existing guest, alongside pageResolve.
+function pageDiagnosticState() {
+  const key = '__dshSidebrowserDiagnosticsV1__'
+  if (window[key]) return window[key]
+  const d = { documentId: `${Date.now()}-${Math.random().toString(36).slice(2)}`, serial: 0,
+    patches: new Map(), watches: new Map(), sources: new Map(), cacheEntries: new Map() }
+  d.cap = pageBoundInt
+  d.text = pageClip
+  d.sensitive = { test: pageSensitiveName }
+  d.url = value => {
+    try {
+      return pageClip(pageRedactURL(value, location.href), 4096)
+    } catch { return d.text(value) }
+  }
+  d.element = pageElementIdentity
+  d.rect = pageElementRect
+  d.resolve = input => {
+    const found = input.ref || input.selector ? pageResolve(input.ref, input.selector) : { el: document.documentElement }
+    if (!found.el) throw new Error(`Inspection target unavailable: ${found.reason}`)
+    return found.el
+  }
+  d.preview = (value, depth = 0) => {
+    if (value === undefined) return '[undefined]'
+    if (value == null || typeof value === 'boolean' || typeof value === 'number') return Number.isFinite(value) || typeof value !== 'number' ? value : String(value)
+    if (typeof value !== 'object') return d.text(value, 1000)
+    if (depth >= 2) return '[object: expand with a targeted read]'
+    try {
+      const output = Array.isArray(value) ? [] : {}
+      const keys = Reflect.ownKeys(value).filter(k => typeof k === 'string').slice(0, 30)
+      for (const k of keys) {
+        if (Array.isArray(output) && k === 'length') continue
+        const prop = Object.getOwnPropertyDescriptor(value, k)
+        const item = d.sensitive.test(k) ? '[redacted]' : !prop || !('value' in prop) ? '[accessor: not evaluated]' : d.preview(prop.value, depth + 1)
+        Object.defineProperty(output, k, { value: item, enumerable: true, configurable: true, writable: true })
+      }
+      return output
+    } catch { return '[unavailable object]' }
+  }
+  d.finish = (value, input = {}) => {
+    const result = { documentId: d.documentId, ...value }, budget = d.cap(input.maxChars, 12000, 30000, 1000)
+    const json = JSON.stringify(result)
+    if (json.length <= budget) return result
+    const ids = {}
+    for (const key of ['patchId','watchId','sourceId']) if (result[key]) ids[key] = result[key]
+    return { documentId: d.documentId, ...ids, truncated: true, totalChars: json.length, preview: json.slice(0, budget - 250) }
+  }
+  d.restorePatch = patch => {
+    const restored = [], conflicts = []
+    for (const item of patch.items) {
+      if (patch.el.style.getPropertyValue(item.name) !== item.applied || patch.el.style.getPropertyPriority(item.name) !== item.appliedPriority) { conflicts.push(item.name); continue }
+      if (item.before === '') patch.el.style.removeProperty(item.name)
+      else patch.el.style.setProperty(item.name, item.before, item.beforePriority)
+      restored.push(item.name)
+    }
+    d.patches.delete(patch.id)
+    return { patchId: patch.id, restored, conflicts, detached: !patch.el.isConnected }
+  }
+  d.dispose = () => {
+    for (const patch of [...d.patches.values()].reverse()) d.restorePatch(patch)
+    for (const watch of d.watches.values()) watch.stop()
+    d.watches.clear(); d.performance?.stop(); d.sources.clear(); d.cacheEntries.clear()
+    delete window[key]
+  }
+  Object.defineProperty(window, key, { value: d, configurable: true })
+  return d
+}
+
+function pageInspect(input = {}) {
+  const d = pageDiagnosticState(), el = d.resolve(input), geometry = pageElementGeometry(el), rect = geometry.rect
+  const properties = input.properties?.length ? input.properties.slice(0, 60) : [
+    'display','position','box-sizing','width','height','min-width','min-height','max-width','max-height',
+    'margin','padding','border','overflow','overflow-x','overflow-y','transform','transform-origin',
+    'flex','flex-direction','flex-wrap','align-items','align-self','justify-content','gap','grid-template-columns','grid-template-rows',
+    'font-size','line-height','color','background-color','visibility','opacity','z-index',
+  ]
+  const readStyle = (node, pseudo) => {
+    try { const css = getComputedStyle(node, pseudo); return Object.fromEntries((pseudo ? [...properties, 'content'] : properties).map(k => [k, css.getPropertyValue(k).slice(0, 600)])) }
+    catch (error) { return { unavailable: d.text(error.message) } }
+  }
+  const credentials = pageCredentialElement(el)
+  const attributes = [...el.attributes].slice(0, 40).map(attr => ({ name: attr.name,
+    value: d.sensitive.test(attr.name) || credentials && attr.name === 'value' ? '[redacted]' : d.text(attr.value, 500) }))
+  const ancestors = []
+  for (let p = el.parentElement; p && ancestors.length < 8; p = p.parentElement) ancestors.push({ ...d.element(p), rect: d.rect(p), styles: readStyle(p) })
+  const { x, y } = pageTargetPoint(geometry, 'clamped-center'), hitTest = pageHitTest(el, { x, y })
+  return d.finish({ source: 'current-main-document', element: d.element(el), attributes, rect,
+    dimensions: pageElementDimensions(el),
+    state: { visible: pageVisible(el), disabled: pageElementDisabled(el), sensitive: credentials, inViewport: geometry.inViewport },
+    styles: readStyle(el), pseudo: { before: readStyle(el, '::before'), after: readStyle(el, '::after') }, ancestors,
+    hitTest: { x, y, hit: d.element(hitTest.hit), targetContainsHit: hitTest.targetContainsHit },
+    viewport: { ...geometry.viewport, devicePixelRatio, scrollX, scrollY,
+      documentWidth: document.documentElement.scrollWidth, documentHeight: document.documentElement.scrollHeight },
+    openShadowRoot: !!el.shadowRoot, children: [...el.children].slice(0, 30).map(d.element),
+    scope: 'Main-document selector/ref. Computed geometry is current; offscreen center hit tests are clamped. Cross-origin frames and closed shadow roots are not traversed.' }, input)
+}
+
+function pageStyles(input = {}) {
+  const d = pageDiagnosticState(), action = input.action || 'read'
+  if (action === 'restore') {
+    const patch = d.patches.get(input.patchId)
+    if (!patch) throw new Error('Unknown or expired patchId in this document')
+    return d.finish(d.restorePatch(patch), input)
+  }
+  const el = d.resolve(input)
+  if (action === 'set') {
+    if (d.patches.size >= 20) throw new Error('Restore existing style patches before creating more (limit 20)')
+    const changes = Object.entries(input.styles || {})
+    if (!changes.length || changes.length > 30) throw new Error('styles needs 1–30 CSS property/value pairs')
+    for (const [name, value] of changes) if (!/^--[\w-]+$|^[a-z][a-z-]*$/.test(name) || typeof value !== 'string' || value.length > 2000) throw new Error('Invalid CSS property or value')
+    const patch = { id: `${d.documentId}:patch:${++d.serial}`, el, items: [] }
+    for (const [name, value] of changes) {
+      const item = { name, before: el.style.getPropertyValue(name), beforePriority: el.style.getPropertyPriority(name) }
+      el.style.setProperty(name, value, input.important ? 'important' : '')
+      item.applied = el.style.getPropertyValue(name); item.appliedPriority = el.style.getPropertyPriority(name)
+      patch.items.push(item)
+    }
+    d.patches.set(patch.id, patch)
+    return d.finish({ patchId: patch.id, element: d.element(el), properties: patch.items.map(item => ({ name: item.name, value: item.applied, priority: item.appliedPriority })) }, input)
+  }
+  const matchedRules = [], inaccessibleSheets = [], limit = d.cap(input.limit, 30, 100)
+  let scanned = 0, truncated = false
+  const scan = (rules, sheet, conditions = []) => {
+    for (const rule of rules) {
+      if (++scanned > 5000 || matchedRules.length >= limit) { truncated = true; return }
+      if (rule.selectorText && rule.style) {
+        let matches = false
+        try { matches = el.matches(rule.selectorText) } catch {}
+        if (matches) matchedRules.push({ selector: rule.selectorText.slice(0, 500), css: rule.style.cssText.slice(0, 2000), sheet, conditions })
+      } else if (rule.styleSheet) {
+        try { scan(rule.styleSheet.cssRules, d.url(rule.href), [...conditions, 'import']) } catch { inaccessibleSheets.push(d.url(rule.href)) }
+      } else if (rule.cssRules) {
+        const condition = rule.conditionText || rule.name || rule.constructor?.name || 'group'
+        let active = null
+        if (rule.media) { try { active = matchMedia(rule.conditionText).matches } catch {} }
+        else if (rule.constructor?.name === 'CSSSupportsRule') { try { active = CSS.supports(rule.conditionText) } catch {} }
+        scan(rule.cssRules, sheet, [...conditions, { text: d.text(condition), active }])
+      }
+    }
+  }
+  const sheets = [...document.styleSheets, ...(document.adoptedStyleSheets || [])]
+  for (const [index, sheet] of sheets.slice(0, 100).entries()) {
+    const name = sheet.href ? d.url(sheet.href) : `inline/adopted:${index}`
+    try { scan(sheet.cssRules, name, [{ sheetDisabled: !!sheet.disabled }]) } catch { inaccessibleSheets.push(name) }
+  }
+  return d.finish({ element: d.element(el), inline: el.style.cssText.slice(0, 5000), matchedRules, inaccessibleSheets, scanned, truncated,
+    scope: 'Readable author CSSOM; grouped conditions reported, not a complete cascade/source-order/specificity resolver. Inherited rules, pseudo-selector matches and cross-origin sheet rules may be missing; use browser_dev_inspect for final computed values.' }, input)
+}
+
+function pageDiagnosticDispose() {
+  window.__dshSidebrowserDiagnosticsV1__?.dispose()
+  return { disposed: true }
+}
+
+function pagePerformance(input = {}) {
+  const d = pageDiagnosticState(), action = input.action || 'read'
+  if (action === 'stop') {
+    d.performance?.stop(); d.performance = null
+    return { documentId: d.documentId, recording: false }
+  }
+  if (action === 'clear' || action === 'start') { d.performance?.stop(); d.performance = null }
+  let p = d.performance
+  if (!p) {
+    const supported = typeof PerformanceObserver === 'function' ? [...(PerformanceObserver.supportedEntryTypes || [])] : []
+    p = { startedAt: Date.now(), startedPerformanceTime: performance.now(), observers: [], entries: [], dropped: 0, frames: [], active: true,
+      supported, observed: [], errors: [], totalLongTaskMs: 0, cls: 0, clsSession: 0, clsStart: 0, clsLast: 0, lcpMs: null,
+      maxObservedInteractionMs: 0, visibilityAtStart: document.visibilityState }
+    const cutoff = action === 'clear' ? p.startedPerformanceTime : 0
+    const onEntries = list => {
+      if (!p.active) return
+      for (const entry of list.getEntries()) {
+        if (entry.startTime < cutoff) continue
+        const row = { type: entry.entryType, name: d.text(entry.name, 200), startTime: entry.startTime, duration: entry.duration }
+        for (const k of ['value','hadRecentInput','interactionId','processingStart','processingEnd','renderTime','loadTime','size']) if (entry[k] !== undefined) row[k] = entry[k]
+        if (entry.entryType === 'layout-shift' && !entry.hadRecentInput) {
+          if (entry.startTime - p.clsLast > 1000 || entry.startTime - p.clsStart > 5000) { p.clsSession = 0; p.clsStart = entry.startTime }
+          p.clsSession += entry.value; p.clsLast = entry.startTime; p.cls = Math.max(p.cls, p.clsSession)
+        }
+        if (entry.entryType === 'largest-contentful-paint') p.lcpMs = entry.startTime
+        if (entry.entryType === 'longtask') p.totalLongTaskMs += entry.duration
+        if (entry.entryType === 'event' && entry.interactionId) p.maxObservedInteractionMs = Math.max(p.maxObservedInteractionMs, entry.duration)
+        p.entries.push(row)
+        if (p.entries.length > 200) { p.entries.shift(); p.dropped++ }
+      }
+    }
+    for (const type of ['paint','longtask','event','first-input','largest-contentful-paint','layout-shift','long-animation-frame']) {
+      if (!supported.includes(type)) continue
+      try {
+        const observer = new PerformanceObserver(onEntries)
+        observer.observe({ type, buffered: true, ...(type === 'event' ? { durationThreshold: 16 } : {}) })
+        p.observers.push(observer); p.observed.push(type)
+      } catch (error) { p.errors.push({ type, error: d.text(error.message) }) }
+    }
+    const frame = now => {
+      if (!p.active) return
+      if (p.lastFrame !== undefined) { p.frames.push(now - p.lastFrame); if (p.frames.length > 120) p.frames.shift() }
+      p.lastFrame = now; p.raf = requestAnimationFrame(frame)
+    }
+    if (typeof requestAnimationFrame === 'function') p.raf = requestAnimationFrame(frame)
+    p.stop = () => { p.active = false; for (const observer of p.observers) observer.disconnect(); if (p.raf) cancelAnimationFrame(p.raf) }
+    d.performance = p
+  }
+  const read = () => {
+    const fields = ['name','entryType','startTime','duration','initiatorType','transferSize','encodedBodySize','decodedBodySize',
+      'domainLookupStart','domainLookupEnd','connectStart','connectEnd','secureConnectionStart','requestStart','responseStart','responseEnd',
+      'domInteractive','domContentLoadedEventEnd','loadEventEnd','redirectCount','type']
+    const entries = kind => performance.getEntriesByType(kind).slice(-d.cap(input.limit, 30, 100)).map(entry => {
+      const row = {}; for (const key of fields) if (entry[key] !== undefined) row[key] = key === 'name' ? d.url(entry[key]) : entry[key]
+      return row
+    })
+    const memory = performance.memory ? { usedJSHeapSize: performance.memory.usedJSHeapSize, totalJSHeapSize: performance.memory.totalJSHeapSize,
+      jsHeapSizeLimit: performance.memory.jsHeapSizeLimit, source: 'non-standard aggregate, not a heap snapshot' } : { unavailable: 'performance.memory not exposed' }
+    return d.finish({ recording: p.active, startedAt: p.startedAt, sampledUntil: Date.now(), visibility: document.visibilityState,
+      visibilityAtStart: p.visibilityAtStart, supportedEntryTypes: p.supported, observedEntryTypes: p.observed, errors: p.errors,
+      navigation: entries('navigation'), resources: entries('resource'), entries: p.entries.slice(-d.cap(input.limit, 30, 100)), dropped: p.dropped,
+      metrics: { observedCLS: p.cls, observedLCPMs: p.lcpMs, observedLongTaskMs: p.totalLongTaskMs,
+        maxObservedInteractionMs: p.maxObservedInteractionMs, frameSamples: p.frames.length,
+        meanFrameIntervalMs: p.frames.length ? p.frames.reduce((sum, n) => sum + n, 0) / p.frames.length : null,
+        maxFrameIntervalMs: p.frames.length ? Math.max(...p.frames) : null }, memory,
+      scope: 'Page Performance APIs. Observed metrics depend on recording interval, visibility and buffered API support. maxObservedInteractionMs is not an INP calculation. No CPU profile, heap graph or browser Trace.' }, input)
+  }
+  return input.sampleMs ? new Promise(resolve => setTimeout(() => resolve(read()), d.cap(input.sampleMs, 0, 2000, 0))) : read()
+}
+
+function pageWatch(input = {}) {
+  const d = pageDiagnosticState(), action = input.action || 'read'
+  if (action === 'list') return d.finish({ watches: [...d.watches.values()].map(w => ({ watchId: w.id, target: w.target, startedAt: w.startedAt })) }, input)
+  if (action !== 'start') {
+    const w = d.watches.get(input.watchId)
+    if (!w) throw new Error('Unknown or expired watchId; use browser_dev_watch action=list')
+    if (action === 'stop') { w.stop(); d.watches.delete(w.id); return { documentId: d.documentId, stopped: true, watchId: w.id } }
+    if (action === 'clear') { w.entries.length = 0; w.dropped = 0 }
+    const rows = w.entries.filter(row => input.sinceId == null || row.id > input.sinceId).slice(0, d.cap(input.limit, 50, 100))
+    return d.finish({ watchId: w.id, target: w.target, startedAt: w.startedAt, entries: rows, dropped: w.dropped,
+      truncated: w.entries.filter(row => input.sinceId == null || row.id > input.sinceId).length > rows.length,
+      nextSinceId: rows.at(-1)?.id ?? input.sinceId ?? 0, scope: 'Observed events/DOM changes since start. Listener registration tracking covers only subsequent calls; no event input values are collected.' }, input)
+  }
+  if (d.watches.size >= 10) throw new Error('Stop an existing watch first (limit 10)')
+  if (input.trackListeners && [...d.watches.values()].some(w => w.trackListeners)) throw new Error('Only one listener-tracking watch can run in this document')
+  const types = (input.events || ['click','change','input','submit','keydown']).slice(0, 20)
+  if (types.some(type => typeof type !== 'string' || type.length > 80)) throw new Error('Invalid event type')
+  const el = d.resolve(input), w = { id: `${d.documentId}:watch:${++d.serial}`, target: d.element(el), startedAt: Date.now(), entries: [], serial: 0, dropped: 0, cleanup: [], active: true, trackListeners: !!input.trackListeners }
+  const push = row => { w.entries.push({ id: ++w.serial, timestamp: Date.now(), ...row }); if (w.entries.length > 200) { w.entries.shift(); w.dropped++ } }
+  for (const type of types) {
+    if (typeof type !== 'string' || type.length > 80) throw new Error('Invalid event type')
+    const listener = event => push({ kind: 'event', type, target: d.element(event.target), trusted: event.isTrusted,
+      defaultPrevented: event.defaultPrevented, ...(type === 'keydown' ? { keyClass: ['Enter','Tab','Escape','Backspace','Delete'].includes(event.key) ? event.key : '[character/modifier]' } : {}) })
+    el.addEventListener(type, listener, true); w.cleanup.push(() => el.removeEventListener(type, listener, true))
+  }
+  if (input.mutations !== false && typeof MutationObserver === 'function') {
+    const observer = new MutationObserver(records => {
+      for (const record of records.slice(0, 200)) push({ kind: 'mutation', type: record.type, target: d.element(record.target),
+        attribute: record.attributeName, added: record.addedNodes.length, removed: record.removedNodes.length })
+      if (records.length > 200) w.dropped += records.length - 200
+    })
+    observer.observe(el, { subtree: true, childList: true, attributes: true, characterData: true }); w.cleanup.push(() => observer.disconnect())
+  }
+  if (typeof ResizeObserver === 'function') {
+    const observer = new ResizeObserver(() => push({ kind: 'resize', rect: d.rect(el) }))
+    observer.observe(el); w.cleanup.push(() => observer.disconnect())
+  }
+  if (input.trackListeners === true && typeof EventTarget !== 'undefined') {
+    // This is a bounded registration history, not an authoritative inventory:
+    // once/AbortSignal removals and pre-existing handlers cannot be reconstructed.
+    for (const name of ['addEventListener','removeEventListener']) {
+      const proto = EventTarget.prototype, before = proto[name]
+      const installed = function (type, handler, options) {
+        const result = Reflect.apply(before, this, arguments)
+        try { if (w.active && (this === el || this?.nodeType === 1 && el.contains(this))) push({ kind: 'listener-registration', operation: name,
+          type: d.text(type, 80), target: d.element(this), capture: typeof options === 'boolean' ? options : !!options?.capture,
+          scope: 'Registration call only; once/signal/duplicate effects not resolved' }) } catch {}
+        return result
+      }
+      try { proto[name] = installed; if (proto[name] === installed) w.cleanup.push(() => { if (proto[name] === installed) proto[name] = before }) }
+      catch (error) { push({ kind: 'unavailable', feature: name, error: d.text(error.message) }) }
+    }
+  }
+  w.stop = () => { w.active = false; for (const fn of w.cleanup.reverse()) { try { fn() } catch {} }; w.entries.length = 0 }
+  d.watches.set(w.id, w)
+  return { documentId: d.documentId, watchId: w.id, target: w.target, startedAt: w.startedAt,
+    trackListeners: input.trackListeners === true, scope: 'Main-document target and subtree; no input values, historical events or V8 listener inventory.' }
+}
+
+async function pageStorage(input = {}) {
+  const d = pageDiagnosticState(), area = input.area || 'local', action = input.action || 'list', limit = d.cap(input.limit, 30, 100)
+  if (['local','session'].includes(area)) {
+    const storage = area === 'local' ? localStorage : sessionStorage
+    if (action === 'get') {
+      if (typeof input.key !== 'string') throw new Error('A storage key is required')
+      const value = storage.getItem(input.key)
+      return d.finish({ area, key: input.key, value: d.sensitive.test(input.key) ? '[redacted]' : value === null ? null : value.slice(0, 16000),
+        truncated: value !== null && value.length > 16000, scope: 'Current origin, read only' }, input)
+    }
+    const keys = []; for (let i = 0; i < Math.min(storage.length, limit); i++) keys.push(storage.key(i))
+    return d.finish({ area, keys, total: storage.length, truncated: storage.length > limit, scope: 'Current origin, keys only; use get for a value' }, input)
+  }
+  if (area === 'indexeddb') {
+    if (!window.indexedDB || typeof indexedDB.databases !== 'function') return { unavailable: 'IndexedDB database enumeration not supported', documentId: d.documentId }
+    const databases = await indexedDB.databases()
+    if (!input.database) return d.finish({ area, databases: databases.slice(0, limit), truncated: databases.length > limit }, input)
+    if (!databases.some(db => db.name === input.database)) throw new Error('Database not found; refusing to create a database while inspecting')
+    const db = await new Promise((resolve, reject) => {
+      let settled = false
+      const request = indexedDB.open(input.database)
+      const fail = message => { if (!settled) { settled = true; clearTimeout(timer); reject(new Error(message)) } }
+      const timer = setTimeout(() => fail('IndexedDB open timed out'), 1200)
+      request.onupgradeneeded = () => { request.transaction.abort(); fail('Database changed or disappeared; creation/upgrade aborted') }
+      request.onblocked = () => fail('IndexedDB open blocked')
+      request.onerror = () => fail(request.error?.message || 'IndexedDB open failed')
+      request.onsuccess = () => { if (settled) { request.result.close(); return }; settled = true; clearTimeout(timer); resolve(request.result) }
+    })
+    try {
+      const stores = [...db.objectStoreNames]
+      if (!input.store) return d.finish({ area, database: db.name, version: db.version, stores }, input)
+      if (!stores.includes(input.store)) throw new Error('Object store not found')
+      const transaction = db.transaction(input.store, 'readonly'), store = transaction.objectStore(input.store)
+      const rows = await new Promise((resolve, reject) => {
+        const rows = []; let truncated = false, settled = false
+        const timer = setTimeout(() => { if (!settled) { settled = true; try { transaction.abort() } catch {}; reject(new Error('IndexedDB read timed out')) } }, 1200)
+        const request = input.recordKey === undefined ? store.openCursor() : store.openCursor(IDBKeyRange.only(input.recordKey))
+        request.onerror = () => { clearTimeout(timer); settled = true; reject(new Error(request.error?.message || 'Cursor failed')) }
+        request.onsuccess = () => {
+          if (settled) return
+          const cursor = request.result
+          if (!cursor || rows.length >= limit) { truncated = !!cursor; settled = true; clearTimeout(timer); resolve({ rows, truncated }); return }
+          rows.push({ key: d.preview(cursor.key), value: d.sensitive.test(String(cursor.key)) ? '[redacted]' : d.preview(cursor.value) }); cursor.continue()
+        }
+      })
+      return d.finish({ area, database: db.name, store: input.store, indexes: [...store.indexNames], keyPath: store.keyPath, ...rows, scope: 'Current origin, readonly transaction, bounded object previews' }, input)
+    } finally { db.close() }
+  }
+  if (area === 'cache') {
+    if (!window.caches) return { documentId: d.documentId, unavailable: 'Cache Storage not exposed' }
+    const names = await caches.keys()
+    if (!input.cacheName) return d.finish({ area, caches: names.slice(0, limit), truncated: names.length > limit }, input)
+    if (!names.includes(input.cacheName)) throw new Error('Cache not found; refusing to create it')
+    const cache = await caches.open(input.cacheName)
+    if (action === 'get') {
+      const entry = d.cacheEntries.get(input.entryId)
+      if (!entry || entry.cacheName !== input.cacheName) throw new Error('Unknown/expired cache entryId; list this cache again')
+      const response = await cache.match(entry.request)
+      if (!response) return { documentId: d.documentId, unavailable: 'Entry no longer exists' }
+      let body
+      if (response.type === 'opaque' || response.type === 'opaqueredirect') body = { unavailable: 'Opaque response' }
+      else body = await pageReadResponseText(response)
+      return d.finish({ area, entryId: input.entryId, status: response.status, type: response.type, body }, input)
+    }
+    const requests = await cache.keys(), entries = []
+    for (const request of requests.slice(0, limit)) {
+      const id = `${d.documentId}:cache:${++d.serial}`
+      d.cacheEntries.set(id, { cacheName: input.cacheName, request })
+      if (d.cacheEntries.size > 100) d.cacheEntries.delete(d.cacheEntries.keys().next().value)
+      entries.push({ entryId: id, url: d.url(request.url), method: request.method })
+    }
+    return d.finish({ area, cacheName: input.cacheName, entries, truncated: requests.length > limit }, input)
+  }
+  throw new Error('Unsupported storage area')
+}
+
+async function pageSources(input = {}) {
+  const d = pageDiagnosticState(), action = input.action || 'list'
+  const sourceMap = (text, base, declared) => {
+    const matches = [...text.matchAll(/[#@]\s*sourceMappingURL\s*=\s*([^\s*]+)/g)]
+    const name = declared || matches.at(-1)?.[1]
+    if (!name) return { sourceMap: null }
+    try {
+      const address = new URL(name, base).href, id = `${d.documentId}:source:${++d.serial}`
+      d.sources.set(id, { url: address, kind: 'source-map', inline: '' })
+      if (d.sources.size > 100) d.sources.delete(d.sources.keys().next().value)
+      return { sourceMap: d.url(address), sourceMapId: id, sourceMapDeclaration: declared ? 'response-header' : 'text-comment-candidate' }
+    } catch { return { sourceMap: null, sourceMapUnavailable: 'Invalid declaration URL' } }
+  }
+  if (action === 'get') {
+    const item = d.sources.get(input.sourceId)
+    if (!item) throw new Error('Unknown/expired sourceId; list sources in this document again')
+    if (!item.url) return d.finish({ sourceId: input.sourceId, kind: item.kind, text: item.inline.slice(0, 16000), truncated: item.inline.length > 16000,
+      ...sourceMap(item.inline, location.href) }, input)
+    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 2000)
+    try {
+      const response = await fetch(item.url, { signal: controller.signal })
+      const body = await pageReadResponseText(response)
+      return d.finish({ sourceId: input.sourceId, url: d.url(item.url), status: response.status,
+        ...sourceMap(body.text || '', response.url || item.url, response.headers.get('sourcemap') || response.headers.get('x-sourcemap')), body,
+        scope: 'Page fetch under its normal permissions; this issues a GET and may be visible in Network. No debugger source registry.' }, input)
+    } finally { clearTimeout(timer) }
+  }
+  const nodes = [...document.querySelectorAll('script,link[rel="stylesheet"],style')], sources = []
+  for (const node of nodes.slice(0, d.cap(input.limit, 50, 100))) {
+    const id = `${d.documentId}:source:${++d.serial}`, url = node.src || node.href || ''
+    const kind = node.localName === 'script' ? 'script' : 'stylesheet'
+    d.sources.set(id, { url, kind, inline: url ? '' : (node.textContent || '').slice(0, 20000) })
+    if (d.sources.size > 100) d.sources.delete(d.sources.keys().next().value)
+    sources.push({ sourceId: id, kind, url: url ? d.url(url) : null, inlineChars: url ? 0 : node.textContent.length, type: node.getAttribute('type') || '' })
+  }
+  return d.finish({ sources, truncated: sources.length < nodes.length, scope: 'DOM-declared script/styles only; dynamically imported modules and unavailable source maps are not enumerated.' }, input)
+}
+
+// Optional document instrumentation; all observers are released on stop.
+function installDebugExtensions(state, api, options) {
+  const { clip, url, push, request, update, finish, body, replace } = api
+  const objects = new Map(), objectIds = new WeakMap(), cleanup = [], connections = new Map()
+  let serial = 0, depth = 0
+  const timers = new Map(), counts = new Map()
+  const summarize = value => {
+    const type = typeof value
+    if (value === null) return { type: 'null', value: null }
+    if (type === 'undefined') return { type }
+    if (!['object','function'].includes(type)) return { type, value: type === 'string' ? clip(value, 2000) : type === 'number' && Number.isFinite(value) || type === 'boolean' ? value : String(value) }
+    let id = objectIds.get(value)
+    if (!id || !objects.has(id)) {
+      id = `${state.documentId}:object:${++serial}`; objects.set(id, value); objectIds.set(value, id)
+      if (objects.size > 200) objects.delete(objects.keys().next().value)
+    }
+    const result = { type, objectId: id, preview: [] }
+    try {
+      result.subtype = Array.isArray(value) ? 'array' : type === 'function' ? 'function' : value instanceof Error ? 'error' : 'object'
+      const keys = Reflect.ownKeys(value).slice(0, 8)
+      for (const key of keys) {
+        const prop = Object.getOwnPropertyDescriptor(value, key)
+        result.preview.push({ name: clip(key, 100), value: !prop || !('value' in prop) ? '[accessor: not evaluated]'
+          : pageSensitiveName(key) ? '[redacted]'
+            : prop.value === null ? 'null' : ['object','function'].includes(typeof prop.value) ? `[${typeof prop.value}]` : clip(prop.value, 200) })
+      }
+    } catch { result.unavailable = 'Object reflection failed (possibly a revoked proxy)' }
+    return result
+  }
+  state.expandObject = input => {
+    const value = objects.get(input.objectId)
+    if (!objects.has(input.objectId)) throw new Error('Object handle expired, evicted or belongs to another document; record the value again')
+    const offset = Math.max(0, Math.floor(input.offset || 0)), limit = Math.max(1, Math.min(50, Math.floor(input.limit || 20)))
+    const keys = Reflect.ownKeys(value), properties = []
+    for (const key of keys.slice(offset, offset + limit)) {
+      const prop = Object.getOwnPropertyDescriptor(value, key)
+      const item = { name: clip(key, 200), enumerable: !!prop?.enumerable, configurable: !!prop?.configurable }
+      if (prop && 'value' in prop) item.value = pageSensitiveName(key) ? { type: 'redacted' } : summarize(prop.value)
+      else { item.accessor = true; item.getter = !!prop?.get; item.setter = !!prop?.set }
+      properties.push(item)
+    }
+    return { documentId: state.documentId, objectId: input.objectId, properties, offset, total: keys.length,
+      truncated: offset + limit < keys.length, observedAt: Date.now(), scope: 'Live own-property descriptors, not a log-time deep snapshot. Getters are not invoked; Proxy reflection traps may run.' }
+  }
+  state.hooks.console = []
+  for (const method of ['log','debug','info','warn','error','dir','table','trace','assert','group','groupCollapsed','groupEnd','time','timeLog','timeEnd','count','countReset','clear']) {
+    if (typeof console[method] !== 'function') continue
+    const installed = replace(console, method, original => function (...args) {
+      const result = Reflect.apply(original, this, args)
+      if (!state.active) return result
+      try {
+        if (method === 'assert' && args[0]) return result
+        const label = args.length && typeof args[0] === 'string' ? clip(args[0], 100) : 'default'
+        if (method === 'time') { timers.set(label, performance.now()); if (timers.size > 100) timers.delete(timers.keys().next().value) }
+        const elapsed = ['timeLog','timeEnd'].includes(method) && timers.has(label) ? performance.now() - timers.get(label) : null
+        if (method === 'timeEnd') timers.delete(label)
+        if (method === 'count') { counts.set(label, (counts.get(label) || 0) + 1); if (counts.size > 100) counts.delete(counts.keys().next().value) }
+        if (method === 'countReset') counts.delete(label)
+        if (method === 'groupEnd') depth = Math.max(0, depth - 1)
+        push('console', { timestamp: Date.now(), source: 'page-console', method, level: method === 'warn' ? 'warning' : ['error','assert'].includes(method) ? 'error' : method === 'debug' ? 'debug' : 'info',
+          message: args.slice(0, 8).map(value => ['object','function'].includes(typeof value) && value !== null ? `[${typeof value}]` : clip(value, 200)).join(' '),
+          args: args.slice(0, 12).map(summarize), argumentsTruncated: args.length > 12, groupDepth: depth,
+          elapsedMs: elapsed, count: counts.get(label) ?? null, stack: clip(new Error().stack, 4000) })
+        if (['group','groupCollapsed'].includes(method)) depth = Math.min(30, depth + 1)
+      } catch { /* Logging must retain the native call's behavior. */ }
+      return result
+    })
+    if (installed) state.hooks.console.push(method)
+  }
+  const addEvent = (row, type, data) => {
+    row.events ||= []; row.totalEvents = (row.totalEvents || 0) + 1
+    row.events.push({ timestamp: Date.now(), type, data: body(data) })
+    if (row.events.length > 20) { row.events.shift(); row.eventsTruncated = true }
+    update(row)
+  }
+  const keep = (connection, dispose) => {
+    connections.set(connection, dispose)
+    if (connections.size > 100) { const [old, stop] = connections.entries().next().value; stop(); connections.delete(old) }
+  }
+  if (typeof WebSocket === 'function') state.hooks.webSocket = replace(window, 'WebSocket', original => new Proxy(original, {
+    construct(target, args, newTarget) {
+      const socket = Reflect.construct(target, args, newTarget)
+      if (!state.active) return socket
+      try {
+        const row = request('websocket', args[0], 'WEBSOCKET'), listeners = []
+        const listen = (type, fn) => { socket.addEventListener(type, fn); listeners.push(() => socket.removeEventListener(type, fn)) }
+        listen('open', () => { row.state = 'open'; update(row) })
+        listen('message', event => addEvent(row, 'received', event.data))
+        listen('error', () => { row.state = 'failed'; row.error = 'WebSocket error event (no browser transport details)'; finish(row) })
+        listen('close', event => { row.state = 'closed'; row.closeCode = event.code; row.wasClean = event.wasClean; finish(row); connections.get(socket)?.(); connections.delete(socket) })
+        const before = socket.send
+        const send = function (...values) { const result = Reflect.apply(before, this, values); if (this === socket && state.active) addEvent(row, 'sent', values[0]); return result }
+        socket.send = send
+        keep(socket, () => { for (const remove of listeners) remove(); if (socket.send === send) socket.send = before })
+      } catch { /* Return the native connection even when probing fails. */ }
+      return socket
+    },
+  }))
+  if (typeof EventSource === 'function') state.hooks.eventSource = replace(window, 'EventSource', original => new Proxy(original, {
+    construct(target, args, newTarget) {
+      const stream = Reflect.construct(target, args, newTarget)
+      if (!state.active) return stream
+      try {
+        const row = request('eventsource', args[0], 'GET'), listeners = [], subscribed = new Set(), add = stream.addEventListener
+        const listen = (type, fn) => { Reflect.apply(add, stream, [type, fn]); listeners.push(() => stream.removeEventListener(type, fn)) }
+        const named = type => { if (typeof type !== 'string' || subscribed.has(type) || ['open','error'].includes(type) || subscribed.size >= 20) return
+          subscribed.add(type); listen(type, event => { addEvent(row, type, event.data); row.lastEventId = clip(event.lastEventId, 200) }) }
+        listen('open', () => { row.state = 'open'; update(row) })
+        listen('error', () => { row.state = stream.readyState === 2 ? 'closed' : 'reconnecting'; update(row) })
+        named('message'); for (const type of (options.eventTypes || []).slice(0, 20)) named(type)
+        // Install our observer before the application's listener: its handler
+        // may synchronously close the stream and remove our subscriptions.
+        const addWrapped = function (type, ...rest) { if (this === stream && state.active) named(type); return Reflect.apply(add, this, [type, ...rest]) }
+        stream.addEventListener = addWrapped
+        const close = stream.close
+        const closeWrapped = function (...values) { const result = Reflect.apply(close, this, values); if (this === stream) { row.state = 'closed'; finish(row); connections.get(stream)?.(); connections.delete(stream) }; return result }
+        stream.close = closeWrapped
+        keep(stream, () => { for (const remove of listeners) remove(); if (stream.addEventListener === addWrapped) stream.addEventListener = add; if (stream.close === closeWrapped) stream.close = close })
+      } catch {}
+      return stream
+    },
+  }))
+  if (typeof navigator.sendBeacon === 'function') state.hooks.beacon = replace(navigator, 'sendBeacon', original => function (...args) {
+    const accepted = Reflect.apply(original, this, args)
+    if (state.active) try { const row = request('beacon', args[0], 'POST'); row.state = accepted ? 'queued' : 'not-queued'; row.requestBody = body(args[1]); row.serverReceiptVerified = false; finish(row) } catch {}
+    return accepted
+  })
+  return () => { for (const dispose of [...cleanup, ...connections.values()]) { try { dispose() } catch {} }; connections.clear(); objects.clear(); timers.clear(); counts.clear() }
+}
+
+// Self-contained helper serialized into the guest. This is document-level
+// instrumentation, not CDP: never claim coverage of workers or early scripts.
+function pageDebug(action, options = {}, cursor = 0) {
+  const key = '__dshSidebrowserDebugV1__'
+  const previous = window[key]
+  if (action === 'object') {
+    if (!previous?.expandObject) throw new Error('No structured Console recorder in this document; start browser_dev_debug before logging')
+    return previous.expandObject(options)
+  }
+  if (action === 'stop') {
+    if (previous) { previous.stop(); delete window[key] }
+    return { stopped: true }
+  }
+  if (action === 'start' && !previous) {
+    const cap = Math.max(10, Math.min(200, options.maxEntries || 100))
+    const bodyLimit = 16384
+    const state = { documentId: `${Date.now()}-${Math.random().toString(36).slice(2)}`, revision: 0,
+      network: [], errors: [], console: [], droppedNetwork: 0, droppedErrors: 0, droppedConsole: 0, active: true,
+      startedAt: Date.now(), captureBodies: options.captureBodies === true,
+      hooks: { fetch: false, xhr: false, resourceTiming: false }, hookErrors: [] }
+    const clip = (v, n = 2048) => pageClip(v, n)
+    const sensitive = { test: pageSensitiveName }
+    const url = value => {
+      try {
+        return clip(pageRedactURL(value, location.href, true), 4096)
+      } catch { return '[invalid URL]' }
+    }
+    const headers = value => {
+      const result = {}
+      try { let count = 0; new Headers(value).forEach((v, k) => { if (++count <= 40) result[clip(k, 128).toLowerCase()] = sensitive.test(k) ? '[redacted]' : clip(v, 512) }) } catch {}
+      return result
+    }
+    const push = (kind, row) => {
+      if (!state.active) return
+      row.revision = ++state.revision
+      const rows = state[kind]
+      if (!rows.includes(row)) rows.push(row)
+      if (rows.length > cap) { rows.shift(); state[{ network: 'droppedNetwork', errors: 'droppedErrors', console: 'droppedConsole' }[kind]]++ }
+    }
+    const update = row => { if (state.network.includes(row)) push('network', row) }
+    const body = value => {
+      if (!state.captureBodies) return { unavailable: 'body capture disabled' }
+      if (value == null) return { text: '', truncated: false }
+      if (typeof value !== 'string' && !(value instanceof URLSearchParams)) return { unavailable: 'binary, FormData or stream body not consumed' }
+      const text = String(value)
+      const bytes = new TextEncoder().encode(text.slice(0, bodyLimit))
+      return { text: new TextDecoder().decode(bytes.subarray(0, bodyLimit), { stream: true }),
+        truncated: text.length > bodyLimit || bytes.length > bodyLimit }
+    }
+    let serial = 0
+    const request = (kind, address, method) => {
+      const row = { id: String(++serial), source: kind, url: url(address), method: clip(method || 'GET', 32).toUpperCase(), startedAt: Date.now(), state: 'pending' }
+      push('network', row); return row
+    }
+    const finish = row => { row.durationMs = Date.now() - row.startedAt; update(row) }
+    const onError = e => {
+      const resource = e.target?.nodeType === 1
+      push('errors', { timestamp: Date.now(), level: 'error', source: resource ? 'resource-error' : 'page-error',
+        message: clip(resource ? `Resource failed: ${url(e.target.src || e.target.href || '')}` : e.message),
+        url: url(e.filename || location.href), line: e.lineno || 0, column: e.colno || 0,
+        stack: clip(e.error?.stack, 4096) })
+    }
+    const onRejection = e => {
+      let message
+      try { message = e.reason?.stack || String(e.reason) } catch { message = '[unserializable rejection]' }
+      push('errors', { timestamp: Date.now(), level: 'error', source: 'unhandled-rejection', message: clip(message, 4096), url: url(location.href) })
+    }
+    window.addEventListener('error', onError, true)
+    window.addEventListener('unhandledrejection', onRejection)
+    const restorers = [], readers = new Set(), xhrCleanup = new Map()
+    const replace = (object, name, wrapper) => {
+      try {
+        const original = object[name], installed = wrapper(original)
+        object[name] = installed
+        if (object[name] !== installed) throw new Error('property is read-only')
+        restorers.push(() => { if (object[name] === installed) object[name] = original })
+        return true
+      } catch (error) { state.hookErrors.push(`${name}: ${clip(error.message, 200)}`); return false }
+    }
+    const stopExtensions = installDebugExtensions(state, { clip, url, push, request, update, finish, body, replace }, options)
+    if (typeof window.fetch === 'function') state.hooks.fetch = replace(window, 'fetch', original => function (...args) {
+      // Call the native implementation with the original arguments. A probe
+      // failure must never prevent or replay the application's request.
+      const promise = Reflect.apply(original, this, args)
+      if (!state.active) return promise
+      let row
+      try {
+        const [input, init] = args
+        row = request('fetch', typeof input === 'string' || input instanceof URL ? input : input.url, init?.method || input?.method)
+        row.requestHeaders = headers(init?.headers ?? input?.headers)
+        row.requestBody = input instanceof Request && init?.body === undefined
+          ? { unavailable: 'Request body stream not consumed' } : body(init?.body)
+      } catch { return promise }
+      return promise.then(response => {
+        try {
+          row.status = response.status; row.statusText = clip(response.statusText); row.responseUrl = url(response.url || row.url)
+          row.responseHeaders = headers(response.headers); row.state = 'complete'; row.redirected = response.redirected
+          row.responseBody = { unavailable: state.captureBodies ? 'body pending' : 'body capture disabled' }
+          finish(row)
+          if (state.active && state.captureBodies) void readBody(response, row)
+        } catch { /* Preserve the original response. */ }
+        return response
+      }, error => {
+        try { row.state = 'failed'; row.error = clip(error?.message || error); finish(row) } catch {}
+        throw error
+      })
+    })
+    async function readBody(response, row) {
+      row.responseBody = await pageReadResponseText(response, { maxBytes: bodyLimit, timeoutMs: 3000, readers, isActive: () => state.active })
+      update(row)
+    }
+    if (typeof XMLHttpRequest !== 'undefined') {
+      const records = new WeakMap(), proto = XMLHttpRequest.prototype
+      replace(proto, 'open', original => function (method, address, ...rest) {
+        const value = Reflect.apply(original, this, [method, address, ...rest])
+        records.set(this, { method, address, requestHeaders: {} }); return value
+      })
+      replace(proto, 'setRequestHeader', original => function (name, value) {
+        const result = Reflect.apply(original, this, [name, value])
+        try {
+          const meta = records.get(this)
+          if (meta && Object.keys(meta.requestHeaders).length < 40) meta.requestHeaders[clip(name, 128).toLowerCase()] = sensitive.test(name) ? '[redacted]' : clip(value, 512)
+        } catch {}
+        return result
+      })
+      state.hooks.xhr = replace(proto, 'send', original => function (...args) {
+        const meta = records.get(this); let row, end
+        try {
+          if (meta) {
+            row = request('xhr', meta.address, meta.method); row.requestHeaders = { ...meta.requestHeaders }; row.requestBody = body(args[0])
+            end = () => {
+              xhrCleanup.get(this)?.(); xhrCleanup.delete(this)
+              if (!state.active) return
+              try {
+                row.status = this.status; row.state = this.status === 0 ? 'failed' : 'complete'; row.responseUrl = url(this.responseURL || meta.address)
+                row.responseHeaders = headers(this.getAllResponseHeaders().trim().split(/[\r\n]+/).filter(Boolean).map(line => { const i = line.indexOf(':'); return [line.slice(0, i), line.slice(i + 1).trim()] }))
+                row.responseBody = !state.captureBodies ? { unavailable: 'body capture disabled' }
+                  : this.responseType === '' || this.responseType === 'text' ? body(this.responseText)
+                    : this.responseType === 'json' ? body(JSON.stringify(this.response)) : { unavailable: 'non-text response' }
+                finish(row)
+              } catch { row.state = 'failed'; row.error = 'XHR details unavailable'; finish(row) }
+            }
+            xhrCleanup.get(this)?.()
+            this.addEventListener('loadend', end, { once: true })
+            xhrCleanup.set(this, () => this.removeEventListener('loadend', end))
+            if (xhrCleanup.size > cap) { const [old, cleanup] = xhrCleanup.entries().next().value; cleanup(); xhrCleanup.delete(old) }
+          }
+        } catch { /* Observing must not block send. */ }
+        try { return Reflect.apply(original, this, args) }
+        catch (error) {
+          if (row) { row.state = 'failed'; row.error = clip(error?.message || error); finish(row); xhrCleanup.get(this)?.(); xhrCleanup.delete(this) }
+          throw error
+        }
+      })
+    }
+    let observer
+    try {
+      observer = new PerformanceObserver(list => {
+        for (const entry of list.getEntries()) {
+          // fetch/XHR are captured above. Timing rows are explicitly metadata
+          // only, and may include entries from before the recorder started.
+          if (performance.timeOrigin + entry.startTime >= state.startedAt && (entry.initiatorType === 'fetch' && state.hooks.fetch || entry.initiatorType === 'xmlhttprequest' && state.hooks.xhr)) continue
+          if (performance.timeOrigin + entry.startTime < (options.resourceSince || 0)) continue
+          const row = request('resource-timing', entry.name, 'UNKNOWN')
+          row.startedAt = Math.round(performance.timeOrigin + entry.startTime)
+          row.preexisting = row.startedAt < state.startedAt
+          row.initiatorType = entry.initiatorType; row.durationMs = entry.duration; row.transferSize = entry.transferSize
+          if (entry.responseStatus > 0) row.status = entry.responseStatus
+          row.state = 'observed'; row.responseBody = { unavailable: 'Resource Timing provides metadata only' }; update(row)
+        }
+      })
+      observer.observe({ type: 'resource', buffered: true })
+      state.hooks.resourceTiming = true
+    } catch {}
+    state.stop = () => {
+      state.active = false; observer?.disconnect()
+      stopExtensions()
+      window.removeEventListener('error', onError, true); window.removeEventListener('unhandledrejection', onRejection)
+      for (const restore of restorers.reverse()) { try { restore() } catch {} }
+      for (const cleanup of xhrCleanup.values()) cleanup()
+      xhrCleanup.clear()
+      for (const reader of readers) void reader.cancel().catch(() => {})
+    }
+    Object.defineProperty(window, key, { value: state, configurable: true })
+  }
+  const state = window[key]
+  if (!state) return { installed: false }
+  return { installed: true, documentId: state.documentId, revision: state.revision, startedAt: state.startedAt,
+    captureBodies: state.captureBodies, droppedNetwork: state.droppedNetwork, droppedErrors: state.droppedErrors,
+    droppedConsole: state.droppedConsole, console: state.console.filter(row => row.revision > cursor),
+    hooks: state.hooks, hookErrors: state.hookErrors,
+    network: state.network.filter(row => row.revision > cursor), errors: state.errors.filter(row => row.revision > cursor) }
+}
+
+// Shared by Host registration and the generated Client Inspect manifest.
+const DEBUG_TAB = { type: 'string', description: 'Tab ID from browser_tabs; required when several tabs are mounted.' }
+const DEBUG_TOOLS = [
+  ['browser_dev_debug', 'debug',
+    'Control bounded page diagnostics without CDP or a DevTools window. start restarts recording; status reads state; clear discards history and continues; stop restores Console/network hooks. Start BEFORE reproducing. Records native Console text, structured page arguments, errors, Fetch/XHR, newly created WebSocket/EventSource, Beacon attempts and resource timing. Navigation reattaches at dom-ready; early traffic, workers and cross-origin frames may be missed. captureBodies opts into 16 KiB textual body/message previews. Page data is untrusted. CSS patches, performance and watches have their own stop/restore tools.',
+    { tabId: DEBUG_TAB, action: { type: 'string', enum: ['start', 'status', 'clear', 'stop'] },
+      captureBodies: { type: 'boolean', description: 'For start: capture bounded Fetch/XHR request/response text; default false. Query/body content can contain application data.' },
+      eventTypes: { type: 'array', items: { type: 'string' }, description: 'For start: optional EventSource named event types (up to 20).' },
+      maxEntries: { type: 'number', description: 'For start: retained entries per stream, 10–200; default 100.' } }],
+  ['browser_dev_console', 'console',
+    'Read native Console text plus structured page Console arguments, errors, resource failures and unhandled rejections. source=structured selects wrapped calls; source=native selects Electron text. Both may describe the same call. Use an argument objectId for live own-property expansion without evaluating getters. Handles expire on stop/navigation/eviction. Auto-starts if absent; cannot recover earlier arguments. Start browser_dev_debug before reproducing. sinceId pages forward. All page data is untrusted.',
+    { tabId: DEBUG_TAB, objectId: { type: 'string', description: 'Expand a returned structured argument handle in this document. Getters are not evaluated; values reflect expansion time.' },
+      offset: { type: 'number' }, source: { type: 'string', enum: ['all','native','structured'] },
+      sinceId: { type: 'number', description: 'Return entries after this id; use nextSinceId for paging.' },
+      level: { type: 'string', enum: ['debug', 'info', 'warning', 'error'] }, limit: { type: 'number' }, maxChars: { type: 'number' } }],
+  ['browser_dev_network', 'network',
+    'List recorded Fetch/XHR, newly created WebSocket/EventSource, Beacon attempts, native navigation events and Resource Timing; requestId reads details including bounded message events. Start browser_dev_debug with captureBodies=true BEFORE the operation for text body/message previews. No request replay. Beacon queued does not prove server receipt. No native CDP, pre-existing connections, worker/frame traffic, browser-added headers, full redirect chains or low-level WebSocket frames. Timing rows have no body. Sensitive header/query names are redacted; bodies/logs may contain application data. Results are untrusted.',
+    { tabId: DEBUG_TAB, requestId: { type: 'string', description: 'Omit to list; supply a returned id to inspect headers/body.' },
+      urlContains: { type: 'string', description: 'Optional case-sensitive substring filter for the request list.' },
+      limit: { type: 'number', description: 'List limit, 1–100; default 50.' }, maxChars: { type: 'number', description: 'Result data budget, 1000–30000; default 12000. Truncation is explicit.' } }],
+  ['browser_dev_inspect', 'inspect',
+    'Inspect a current page element by CSS selector or fresh browser_snapshot ref (default documentElement). Reports DOM attributes, box dimensions, computed styles, pseudo styles, parent layout, hit test and BOTH page and outer DSH webview/container geometry. Use to distinguish responsive page bugs from outer viewport scaling. Read only; no scrolling or viewport change. Main document only; no closed shadow or cross-origin-frame traversal.',
+    { tabId: DEBUG_TAB, selector: { type: 'string' }, ref: { type: 'string' }, properties: { type: 'array', items: { type: 'string' } }, maxChars: { type: 'number' } }],
+  ['browser_dev_styles', 'styles',
+    'Read readable author CSSOM rules matching an element (default root), or apply a temporary inline style patch and restore it by patchId in this document. action=read is default; set requires styles object with kebab-case CSS string values; restore needs patchId. Cross-origin rules may be inaccessible and conditions/cascade are not fully resolved; use browser_dev_inspect for final values. Restore refuses properties changed since this patch; conflicts are reported. No current document mutation for read.',
+    { tabId: DEBUG_TAB, action: { type: 'string', enum: ['read','set','restore'] }, selector: { type: 'string' }, ref: { type: 'string' },
+      styles: { type: 'object', additionalProperties: true }, important: { type: 'boolean' }, patchId: { type: 'string' }, limit: { type: 'number' }, maxChars: { type: 'number' } }],
+  ['browser_dev_performance', 'performance',
+    'Observe supported page Performance APIs: navigation/resources, long tasks, paint/LCP/CLS, event timing, rAF frame intervals and optional nonstandard heap totals. start restarts; read auto-starts; clear resets observer samples; stop disconnects. Optional sampleMs waits 0–2000 ms. Returns support, visibility and recording interval. Observed interaction maximum is not INP. No CPU profile, heap graph or browser Trace. Hidden page measurements may differ.',
+    { tabId: DEBUG_TAB, action: { type: 'string', enum: ['start','read','clear','stop'] }, sampleMs: { type: 'number' }, limit: { type: 'number' }, maxChars: { type: 'number' } }],
+  ['browser_dev_storage', 'storage',
+    'Read CURRENT-ORIGIN storage without writes: area local/session lists keys, action=get reads key; indexeddb lists databases, database lists stores, database+store reads bounded records (optional recordKey); cache lists cache names, cacheName lists entryIds, get+cacheName+entryId reads a bounded cached text body. Does not create absent databases/caches. Common credential key names are redacted. No cookies or cross-origin/partition access. Opaque cache bodies unavailable.',
+    { tabId: DEBUG_TAB, area: { type: 'string', enum: ['local','session','indexeddb','cache'] }, action: { type: 'string', enum: ['list','get'] }, key: { type: 'string' },
+      database: { type: 'string' }, store: { type: 'string' }, recordKey: {}, cacheName: { type: 'string' }, entryId: { type: 'string' }, limit: { type: 'number' }, maxChars: { type: 'number' } }],
+  ['browser_dev_watch', 'watch',
+    'Watch a main-document element/subtree by selector or fresh ref (default root): start returns watchId; read/clear/stop require watchId; list shows active watches. Observes future DOM mutations, resize and specified events without collecting input values. Optional trackListeners records subsequent add/remove calls only, not all existing/active handlers or once/signal effects. At most one listener-tracking watch. Stops on document replacement or plugin cleanup.',
+    { tabId: DEBUG_TAB, action: { type: 'string', enum: ['start','read','list','clear','stop'] }, selector: { type: 'string' }, ref: { type: 'string' }, watchId: { type: 'string' },
+      events: { type: 'array', items: { type: 'string' } }, mutations: { type: 'boolean' }, trackListeners: { type: 'boolean' }, sinceId: { type: 'number' }, limit: { type: 'number' }, maxChars: { type: 'number' } }],
+  ['browser_dev_sources', 'sources',
+    'List DOM-declared script and stylesheet sourceIds; action=get reads a returned sourceId under normal page permissions. Inline content is read locally; external content issues a GET with a bounded text preview. Reports source-map header/comment URLs when available; not a debugger source registry, closure reader or breakpoint tool. Dynamic imports and inaccessible cross-origin sources can be missing. SourceIds expire with the document.',
+    { tabId: DEBUG_TAB, action: { type: 'string', enum: ['list','get'] }, sourceId: { type: 'string' }, limit: { type: 'number' }, maxChars: { type: 'number' } }],
+]
+
+// Renderer-owned recorder for the existing, Session-verified webview. No
+// remote debugging ports, Electron main-process patches or DevTools windows.
+class BrowserDebugRecorder {
+  constructor(ctx, driver) {
+    this.driver = driver
+    this.states = new Map()
+    this.diagnostics = new Map()
+    this.unsubscribers = []
+    const removed = ctx.remote?.$on?.('api-session/removed', sessionId => {
+      for (const state of this.states.values()) if (state.sessionId === sessionId) void this.stop(state)
+      for (const item of this.diagnostics.values()) if (item.sessionId === sessionId) void this.disposeDiagnostic(item)
+    })
+    if (typeof removed === 'function') this.unsubscribers.push(removed)
+  }
+
+  capabilities() {
+    return { console: 'electron-text-and-page-argument-handles', errors: 'main-document-events',
+      network: 'fetch-xhr-new-websocket-eventsource-beacon-resource-timing', nativeCDP: false,
+      limitations: ['No history before start, except buffered Resource Timing metadata.',
+        'Navigation reinstalls hooks at dom-ready; earlier Fetch/XHR may be missed.',
+        'No worker, cross-origin frame, pre-existing connection, browser-added header or full redirect-chain capture.',
+        'Fetch/XHR headers and bodies are only those accessible to page JavaScript; timing rows have no bodies.',
+        'Console handles refer to bounded live page objects since start, not V8 debugger objects. Native Console remains text.',
+        'Page instrumentation can be replaced or bypassed by site code. HTTP error status is not a transport failure.'] }
+  }
+
+  resolve(sessionId, input) {
+    const resolved = this.driver.resolve(sessionId, input.tabId)
+    this.driver.requireDrivable(resolved.carrier, 'be inspected')
+    return resolved
+  }
+
+  key(sessionId, tabId) { return JSON.stringify([sessionId, tabId]) }
+
+  safeUrl(value) {
+    if (!value) return ''
+    try { return pageClip(pageRedactURL(value), 4096) }
+    catch { return pageClip(value, 4096) }
+  }
+
+  async disposeDiagnostic(item) {
+    if (this.diagnostics.get(item.key) === item) this.diagnostics.delete(item.key)
+    try { if (item.guest.isConnected) await this.driver.run(item.guest, pageDiagnosticDispose, [], 1500) } catch {}
+  }
+
+  async diagnostic(method, sessionId, input, resolved) {
+    const key = this.key(sessionId, resolved.tabId), previous = this.diagnostics.get(key)
+    if (previous && previous.guest !== resolved.guest) await this.disposeDiagnostic(previous)
+    this.diagnostics.set(key, { key, sessionId, tabId: resolved.tabId, guest: resolved.guest })
+    if (!this.sweep) this.sweep = setInterval(() => {
+      for (const item of this.diagnostics.values()) if (!item.guest.isConnected || !this.driver.inventory(item.sessionId).some(tab => tab.tabId === item.tabId)) void this.disposeDiagnostic(item)
+    }, 1000)
+    const helpers = { inspect: pageInspect, styles: pageStyles, performance: pagePerformance, storage: pageStorage, watch: pageWatch, sources: pageSources }
+    const result = await this.driver.run(resolved.guest, helpers[method], [input], 5000)
+    if (method === 'inspect') {
+      result.hostViewport = { guest: pageRendererBox(resolved.guest), container: resolved.guest.parentElement ? pageRendererBox(resolved.guest.parentElement) : null,
+        preset: this.driver.viewport?.frameOf?.(resolved.tabId)?.preset || 'unknown', source: 'DSH renderer DOM; page viewport is reported separately' }
+      try { if (typeof resolved.guest.getZoomFactor === 'function') result.hostViewport.zoomFactor = resolved.guest.getZoomFactor() } catch {}
+    }
+    return { tabId: resolved.tabId, ...result }
+  }
+
+  async start(sessionId, input, resolved) {
+    const { guest, tabId } = resolved
+    const key = this.key(sessionId, tabId)
+    const existing = this.states.get(key)
+    if (existing) {
+      const cleanup = await this.stop(existing)
+      if (cleanup?.pageHooksRestored === false) throw new Error(`Could not restart page recorder: ${cleanup.cleanupError}`)
+    }
+    const state = { key, sessionId, tabId, guest, active: true, captureBodies: input.captureBodies === true,
+      maxEntries: Math.max(10, Math.min(200, Math.floor(input.maxEntries || 100))), startedAt: Date.now(),
+      resourceSince: input.resourceSince || 0,
+      eventTypes: (input.eventTypes || []).slice(0, 20),
+      console: [], network: [], seq: 0, droppedConsole: 0, droppedNetwork: 0, pageDropped: {}, listeners: [], cursor: 0 }
+    this.states.set(key, state)
+    const listen = (name, handler) => { guest.addEventListener(name, handler); state.listeners.push(() => guest.removeEventListener(name, handler)) }
+    listen('console-message', event => {
+      if (!state.active) return
+      const levels = { 0: 'debug', 1: 'info', 2: 'warning', 3: 'error' }
+      this.appendConsole(state, { timestamp: Date.now(), source: 'electron-console',
+        level: levels[event.level] || ({ log: 'info', warn: 'warning', verbose: 'debug' })[event.level] || String(event.level || 'info'),
+        message: String(event.message || '').slice(0, 4096), url: this.safeUrl(event.sourceId), line: event.line || 0 })
+    })
+    listen('dom-ready', () => { if (state.active) void this.collect(state).catch(error => { state.lastError = String(error.message).slice(0, 500) }) })
+    for (const type of ['did-start-navigation','did-redirect-navigation','did-navigate','did-fail-load']) listen(type, event => {
+      if (!state.active) return
+      const record = { id: `native:${++state.seq}`, source: 'electron-navigation', event: type, url: this.safeUrl(event.url || event.validatedURL),
+        startedAt: Date.now(), state: type === 'did-fail-load' ? 'failed' : 'observed', isMainFrame: event.isMainFrame !== false }
+      for (const name of ['httpResponseCode','httpStatusText','errorCode','errorDescription']) if (event[name] !== undefined) record[name] = event[name]
+      state.network.push(record); if (state.network.length > state.maxEntries) { state.network.shift(); state.droppedNetwork++ }
+    })
+    listen('render-process-gone', () => { state.lastError = 'Guest renderer exited; recording stopped'; void this.stop(state) })
+    state.timer = setInterval(() => {
+      if (!guest.isConnected || !this.driver.inventory(sessionId).some(tab => tab.tabId === tabId)) { void this.stop(state); return }
+      void this.collect(state).catch(error => { state.lastError = String(error.message).slice(0, 500) })
+    }, 1000)
+    try { await this.collect(state) }
+    catch (error) { await this.stop(state); throw error }
+    return state
+  }
+
+  appendConsole(state, row) {
+    row.id = ++state.seq
+    state.console.push(row)
+    if (state.console.length > state.maxEntries) { state.console.shift(); state.droppedConsole++ }
+  }
+
+  collect(state) {
+    if (!state.active) return Promise.resolve()
+    if (state.task) return state.task
+    state.task = (async () => {
+      const value = await this.driver.run(state.guest, pageDebug, ['start', { captureBodies: state.captureBodies, maxEntries: state.maxEntries, resourceSince: state.resourceSince, eventTypes: state.eventTypes }, state.cursor], 3500)
+      if (!state.active) return
+      if (!value?.installed) throw new Error('Page recorder could not be installed')
+      // A new document has an independent revision sequence. Its first pull
+      // must start at zero even when the old document had a larger cursor.
+      if (state.documentId && state.documentId !== value.documentId) {
+        state.cursor = 0
+        const fresh = await this.driver.run(state.guest, pageDebug, ['read', {}, 0], 3500)
+        if (!state.active) return
+        this.merge(state, fresh)
+      } else this.merge(state, value)
+      delete state.lastError
+    })().finally(() => { state.task = null })
+    return state.task
+  }
+
+  merge(state, value) {
+    state.documentId = value.documentId; state.cursor = value.revision
+    state.hooks = value.hooks; state.hookErrors = value.hookErrors
+    state.pageDropped[value.documentId] = { network: value.droppedNetwork, errors: value.droppedErrors, console: value.droppedConsole }
+    // Keep counters bounded across many navigations too.
+    const docs = Object.keys(state.pageDropped)
+    if (docs.length > 20) delete state.pageDropped[docs[0]]
+    for (const row of value.errors || []) this.appendConsole(state, { ...row, documentId: value.documentId })
+    for (const row of value.console || []) this.appendConsole(state, { ...row, documentId: value.documentId })
+    for (const row of value.network || []) {
+      const id = `${value.documentId}:${row.id}`
+      const old = state.network.findIndex(record => record.id === id)
+      const record = { ...row, id, documentId: value.documentId }
+      if (old >= 0) state.network[old] = record
+      else {
+        state.network.push(record)
+        if (state.network.length > state.maxEntries) { state.network.shift(); state.droppedNetwork++ }
+      }
+    }
+  }
+
+  status(state) {
+    return { tabId: state.tabId, recording: state.active, startedAt: state.startedAt,
+      captureBodies: state.captureBodies, maxEntries: state.maxEntries, consoleCount: state.console.length,
+      requestCount: state.network.length, droppedConsole: state.droppedConsole, droppedNetwork: state.droppedNetwork,
+      hooks: state.hooks, hookErrors: state.hookErrors,
+      pageDropped: state.pageDropped, ...(state.lastError ? { collectionError: state.lastError } : {}), capabilities: this.capabilities() }
+  }
+
+  boundRows(rows, maxChars, preview) {
+    const kept = []; let used = 0
+    for (const row of rows) {
+      const size = JSON.stringify(row).length
+      if (used + size > maxChars) {
+        // Still return a usable id and preview when a single entry exceeds the
+        // budget; otherwise a console cursor could never get past that entry.
+        if (!kept.length) kept.push({ ...preview(row), truncated: true })
+        break
+      }
+      kept.push(row); used += size
+    }
+    return kept
+  }
+
+  async stop(state) {
+    if (!state.active) return state.stopResult
+    state.active = false; clearInterval(state.timer)
+    for (const remove of state.listeners) remove()
+    state.listeners = []
+    if (this.states.get(state.key) === state) this.states.delete(state.key)
+    try {
+      await state.task?.catch(() => {})
+      if (state.guest.isConnected) await this.driver.run(state.guest, pageDebug, ['stop'], 1500)
+      state.stopResult = { pageHooksRestored: true }
+    } catch (error) { state.stopResult = { pageHooksRestored: false, cleanupError: String(error.message).slice(0, 500) } }
+    state.console.length = 0; state.network.length = 0
+    return state.stopResult
+  }
+
+  async query(method, sessionId, input) {
+    const resolved = this.resolve(sessionId, input)
+    if (['inspect','styles','performance','storage','watch','sources'].includes(method)) return this.diagnostic(method, sessionId, input, resolved)
+    const key = this.key(sessionId, resolved.tabId)
+    let state = this.states.get(key)
+    if (state && state.guest !== resolved.guest) { await this.stop(state); state = undefined }
+    const action = input.action || 'status'
+    if (method === 'debug' && action === 'stop') {
+      const cleanup = state ? await this.stop(state) : {}
+      return { tabId: resolved.tabId, recording: false, stopped: true, ...cleanup }
+    }
+    if (method === 'debug' && action === 'status' && !state) return { tabId: resolved.tabId, recording: false, capabilities: this.capabilities() }
+    if (method === 'debug' && action === 'clear') {
+      if (!state) return { tabId: resolved.tabId, recording: false, cleared: true }
+      // Reset the document buffer as well; old entries must not reappear.
+      const config = { captureBodies: state.captureBodies, maxEntries: state.maxEntries, eventTypes: state.eventTypes, resourceSince: Date.now() }
+      const cleanup = await this.stop(state)
+      if (cleanup?.pageHooksRestored === false) throw new Error(`Could not clear page recorder: ${cleanup.cleanupError}`)
+      state = await this.start(sessionId, config, resolved)
+      return { ...this.status(state), cleared: true }
+    }
+    let startedNow = false
+    if (method === 'debug' && action === 'start' || !state) { state = await this.start(sessionId, input, resolved); startedNow = true }
+    else await this.collect(state)
+    const status = { ...this.status(state), startedNow }
+    if (method === 'debug') return status
+    const limit = Math.max(1, Math.min(100, Math.floor(input.limit || 50)))
+    const maxChars = Math.max(1000, Math.min(30000, Math.floor(input.maxChars || 12000)))
+    if (method === 'console') {
+      if (input.objectId) {
+        const object = await this.driver.run(resolved.guest, pageDebug, ['object', input], 3500)
+        const properties = this.boundRows(object.properties, maxChars, row => ({ name: row.name,
+          ...(row.value?.objectId ? { value: { type: row.value.type, objectId: row.value.objectId } } : { preview: '[property preview exceeds budget]' }) }))
+        return { ...status, ...object, properties, truncated: object.truncated || properties.length < object.properties.length || properties.some(row => row.truncated) }
+      }
+      let rows = state.console.filter(row => (input.sinceId == null || row.id > input.sinceId) && (!input.level || row.level === input.level)
+        && (!input.source || input.source === 'all' || (input.source === 'structured' ? row.source === 'page-console' : row.source === 'electron-console')))
+      const count = rows.length
+      rows = input.sinceId == null ? rows.slice(-limit) : rows.slice(0, limit)
+      rows = this.boundRows(rows, maxChars, row => ({ id: row.id, timestamp: row.timestamp, level: row.level,
+        source: row.source, message: row.message.slice(0, maxChars - 600),
+        ...(row.args ? { args: row.args.slice(0, 3).map(arg => ({ type: arg.type, ...(arg.objectId ? { objectId: arg.objectId } : {}) })) } : {}) }))
+      return { ...status, entries: rows, truncated: rows.length < count || rows.some(row => row.truncated),
+        nextSinceId: rows.at(-1)?.id ?? input.sinceId ?? 0 }
+    }
+    if (input.requestId) {
+      const row = state.network.find(row => row.id === input.requestId)
+      if (!row) throw new Error('Request not found in this tab recorder; it may have been cleared or evicted. List browser_dev_network again.')
+      const json = JSON.stringify(row)
+      return json.length <= maxChars ? { ...status, request: row, truncated: false }
+        : { ...status, request: { id: row.id, url: row.url, method: row.method, state: row.state },
+          detailPreview: json.slice(0, maxChars), truncated: true, totalChars: json.length }
+    }
+    let rows = state.network.filter(row => !input.urlContains || row.url.includes(input.urlContains))
+      .map(({ requestBody, responseBody, requestHeaders, responseHeaders, events, ...row }) => row)
+    const count = rows.length
+    rows = rows.slice(-limit)
+    rows = this.boundRows(rows, maxChars, row => ({ id: row.id, source: row.source, method: row.method,
+      url: row.url.slice(0, 200), state: row.state, ...(row.status == null ? {} : { status: row.status }) }))
+    return { ...status, requests: rows, truncated: rows.length < count || rows.some(row => row.truncated) }
+  }
+
+  dispose() {
+    clearInterval(this.sweep)
+    for (const item of this.diagnostics.values()) void this.disposeDiagnostic(item)
+    for (const remove of this.unsubscribers) remove()
+    for (const state of this.states.values()) void this.stop(state)
+  }
+}
+
 // Embedded beside the reference driver. Host and Client use an explicit result
 // envelope so a page-reported error settles the Inspect request immediately.
 const referenceAct = BrowserDriver.prototype.act
+PAGE_HELPERS.push(pageDiagnosticState, pageInspect, pageStyles, pagePerformance, pageWatch,
+  pageStorage, pageSources, pageDiagnosticDispose, installDebugExtensions, pageDebug)
 
 BrowserDriver.prototype.snapshot = async function (sessionId, input) {
   const deadline = beginCall()
@@ -2678,7 +3773,7 @@ BrowserDriver.prototype.snapshot = async function (sessionId, input) {
   const result = await this.run(guest, pageSnapshot, [input.maxChars, input.maxElements], budgetLeft(deadline))
   return prune({ tabId, ...result, loading: this.isLoading(guest), failed: isErrorPage(result.url),
     capabilities: { nativeInput: typeof guest.sendInputEvent === 'function', nativeText: typeof guest.insertText === 'function',
-      mainDocument: true, crossOriginFrameDOM: false, networkCapture: false } })
+      mainDocument: true, crossOriginFrameDOM: false, networkCapture: 'opt-in-document-probes', diagnostics: 'browser_dev_*', nativeCDP: false } })
 }
 
 BrowserDriver.prototype.extract = async function (sessionId, input) {
@@ -2796,12 +3891,16 @@ function buildProvider(ctx, viewport) {
   const driver = new BrowserDriver(ctx, viewport)
   AGENT_VISUALS.get(ctx)?.dispose()
   const feedback = new AgentVisualFeedback(ctx, driver)
+  const debug = new BrowserDebugRecorder(ctx, driver)
   AGENT_VISUALS.set(ctx, feedback)
-  provider.dispose = () => feedback.dispose()
+  provider.dispose = () => { debug.dispose(); feedback.dispose() }
   provider.feedback = feedback
+  provider.debug = debug
   const active = new Set()
   const TAB = { type: 'string' }
   provider.manifest.methods.push(
+    ...DEBUG_TOOLS.map(([_name, name, description, properties]) => ({ name, description,
+      inputSchema: { type: 'object', properties, additionalProperties: false } })),
     { name: 'snapshot', description: 'Read a bounded structured main-document snapshot.', inputSchema: { type: 'object', properties: { tabId: TAB, maxChars: { type: 'number' }, maxElements: { type: 'number' } }, additionalProperties: false } },
     { name: 'extract', description: 'Extract rendered table rows, links, headings or list items.', inputSchema: { type: 'object', properties: { tabId: TAB, kind: { type: 'string', enum: ['links','headings','tables','list'] }, selector: { type: 'string' }, limit: { type: 'number' }, maxChars: { type: 'number' } }, required: ['kind'], additionalProperties: false } },
   )
@@ -2824,7 +3923,8 @@ function buildProvider(ctx, viewport) {
     active.add(sessionId)
     const visual = feedback.begin(sessionId, method, input || {})
     try {
-      const value = method === 'snapshot' ? await driver.snapshot(sessionId, input || {})
+      const value = DEBUG_TOOLS.some(row => row[1] === method) ? await debug.query(method, sessionId, input || {})
+        : method === 'snapshot' ? await driver.snapshot(sessionId, input || {})
         : method === 'extract' ? await driver.extract(sessionId, input || {}) : await query(method, input, context)
       feedback.finish(visual, value, false)
       return { transportVersion: 1, ok: true, value: prune(value) }

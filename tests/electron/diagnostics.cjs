@@ -1,0 +1,58 @@
+const assert = require('node:assert/strict')
+module.exports = async (call, view) => {
+  const inspect = await call('inspect', { selector: '#name' })
+  assert.ok(inspect.rect.width > 0 && inspect.hostViewport.guest.rect.width > 0)
+  assert.ok(inspect.styles.display)
+  const rules = await call('styles', { selector: 'table' })
+  assert.ok(rules.matchedRules.some(rule => rule.selector.includes('table')))
+  const patch = await call('styles', { action: 'set', selector: '#name', styles: { width: '37px' } })
+  assert.equal((await call('inspect', { selector: '#name' })).styles.width, '37px')
+  assert.ok((await call('styles', { action: 'restore', patchId: patch.patchId })).restored.includes('width'))
+  const conflict = await call('styles', { action: 'set', selector: '#name', styles: { width: '38px' } })
+  await call('eval', { code: 'document.querySelector("#name").style.width="39px"' })
+  assert.ok((await call('styles', { action: 'restore', patchId: conflict.patchId })).conflicts.includes('width'))
+  await call('eval', { code: 'document.querySelector("#name").style.removeProperty("width");window.originalEventAdd=EventTarget.prototype.addEventListener' })
+  const watch = await call('watch', { action: 'start', selector: '#form', trackListeners: true, events: ['input'] })
+  await call('eval', { code: `document.querySelector('#name').addEventListener('change',()=>{});document.querySelector('#name').dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#form').setAttribute('data-probe','changed')` })
+  const watched = await call('watch', { watchId: watch.watchId })
+  assert.ok(watched.entries.some(row => row.kind === 'event'))
+  assert.ok(watched.entries.some(row => row.kind === 'mutation'))
+  assert.ok(watched.entries.some(row => row.kind === 'listener-registration'))
+  await call('watch', { action: 'stop', watchId: watch.watchId })
+  assert.equal((await call('eval', { code: 'EventTarget.prototype.addEventListener===originalEventAdd' })).value, true)
+  const perf = await call('performance', { action: 'start', sampleMs: 100 })
+  assert.ok(perf.supportedEntryTypes.includes('resource'))
+  assert.ok(perf.navigation.length)
+  await call('performance', { action: 'stop' })
+  await call('eval', { code: `(async()=>{
+    localStorage.setItem('diagnostic-theme','dark');sessionStorage.setItem('diagnostic-tab','one');
+    await new Promise((resolve,reject)=>{const r=indexedDB.open('diagnostic-db',1);r.onupgradeneeded=()=>r.result.createObjectStore('items',{keyPath:'id'});r.onerror=()=>reject(r.error);r.onsuccess=()=>{const db=r.result;const t=db.transaction('items','readwrite');t.objectStore('items').put({id:1,name:'record-fixture'});t.oncomplete=()=>{db.close();resolve()};t.onerror=()=>reject(t.error)}});
+    const cache=await caches.open('diagnostic-cache');await cache.put('/cached-fixture',new Response('cached-text-fixture',{headers:{'content-type':'text/plain'}}));
+    return true;
+  })()` })
+  assert.equal((await call('storage', { area: 'local', action: 'get', key: 'diagnostic-theme' })).value, 'dark')
+  assert.equal((await call('storage', { area: 'session', action: 'get', key: 'diagnostic-tab' })).value, 'one')
+  assert.ok((await call('storage', { area: 'indexeddb' })).databases.some(db => db.name === 'diagnostic-db'))
+  assert.ok((await call('storage', { area: 'indexeddb', database: 'diagnostic-db' })).stores.includes('items'))
+  const records = await call('storage', { area: 'indexeddb', database: 'diagnostic-db', store: 'items' })
+  assert.equal(records.rows[0].value.name, 'record-fixture')
+  const absent = await call('storage', { area: 'indexeddb', database: 'missing-diagnostic-db' }).then(()=>null,error=>error)
+  assert.match(absent.message, /not found/)
+  assert.ok(!(await call('storage', { area: 'indexeddb' })).databases.some(db => db.name === 'missing-diagnostic-db'))
+  const cached = await call('storage', { area: 'cache', cacheName: 'diagnostic-cache' })
+  assert.equal((await call('storage', { area: 'cache', cacheName: 'diagnostic-cache', action: 'get', entryId: cached.entries[0].entryId })).body.text, 'cached-text-fixture')
+  const sources = await call('sources')
+  const script = sources.sources.find(row => row.kind === 'script')
+  assert.ok((await call('sources', { action: 'get', sourceId: script.sourceId })).text.includes('window.events'))
+  await call('eval', { code: 'const externalScript=document.createElement("script");externalScript.src="/asset.js";document.head.append(externalScript)' })
+  const external = (await call('sources')).sources.find(row => row.url?.endsWith('/asset.js'))
+  const externalSource = await call('sources', { action: 'get', sourceId: external.sourceId })
+  assert.ok(externalSource.body.text.includes('externalDiagnostic'))
+  assert.ok(externalSource.sourceMap.endsWith('/asset.js.map'))
+  const map = await call('sources', { action: 'get', sourceId: externalSource.sourceMapId })
+  assert.ok(map.body.text.includes('original.ts'))
+  assert.equal(view.isDevToolsOpened(), false)
+  return { inspectBothLayers: true, computedStyles: true, readableCSS: true, styleRestore: true, conflictPreserved: true,
+    mutationAndEvents: true, listenerTrackingAndRestore: true, performance: true, localAndSession: true,
+    indexedDB: true, noDatabaseCreation: true, cacheBody: true, inlineSource: true, externalSourceAndMap: true }
+}

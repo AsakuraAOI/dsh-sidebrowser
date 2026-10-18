@@ -16,3 +16,4 @@
 
 .dsh/
 .credentials*
+**/.credentials*
