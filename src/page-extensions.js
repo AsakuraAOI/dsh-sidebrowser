@@ -1,7 +1,7 @@
 // Fixed page-side readers. These functions are embedded into the Client bundle
 // by scripts/build.mjs; they run in the selected guest, never in the DSH host.
 
-export function pageExtract(kind, selector, limit, maxChars) {
+export function pageExtract(kind, selector, limit, maxChars, options = {}) {
   const result = { url: location.href, title: document.title || '', kind, items: [], truncated: false }
   let remaining = Math.max(128, Math.min(50000, maxChars || 10000))
   const count = Math.max(1, Math.min(kind === 'tables' ? 10 : 200, Math.floor(limit || 50)))
@@ -16,7 +16,7 @@ export function pageExtract(kind, selector, limit, maxChars) {
   const defaults = { links: 'a[href]', headings: 'h1,h2,h3,h4,h5,h6', tables: 'table', list: 'li' }
   if (!defaults[kind]) throw new Error('Unsupported extraction kind')
   let nodes
-  try { nodes = document.querySelectorAll(selector || defaults[kind]) }
+  try { nodes = pageScopedNodes(pageReadRoot(options).root, selector || defaults[kind]) }
   catch { throw new Error('Invalid extraction selector') }
   for (const el of nodes) {
     if (!pageVisible(el)) continue
@@ -44,12 +44,13 @@ export function pageExtract(kind, selector, limit, maxChars) {
   return result
 }
 
-export function pageSnapshot(maxChars, maxElements) {
-  const read = pageReadText(Math.max(128, Math.min(30000, maxChars || 8000)))
-  const controls = pageReadElements(Math.max(1, Math.min(200, maxElements || 80)))
-  const headings = pageExtract('headings', '', 40, 2000)
-  const links = pageExtract('links', '', 40, 4000)
-  const frames = [...document.querySelectorAll('iframe,frame')].slice(0, 30).map((el, index) => {
+export function pageSnapshot(maxChars, maxElements, options = {}) {
+  const scope = { ...options, ...pageReadRoot(options, true) }
+  const read = pageReadText(Math.max(128, Math.min(30000, maxChars || 8000)), scope)
+  const controls = pageReadElements(Math.max(1, Math.min(200, maxElements || 80)), scope)
+  const headings = pageExtract('headings', '', 40, 2000, scope)
+  const links = pageExtract('links', '', 40, 4000, scope)
+  const frames = pageScopedNodes(scope.root, 'iframe,frame').slice(0, 30).map((el, index) => {
     let readable = false
     try { readable = !!el.contentDocument?.documentElement } catch {}
     return { index, title: (el.getAttribute('title') || '').slice(0, 200), src: (el.getAttribute('src') || '').slice(0, 2000), readable }
@@ -58,9 +59,10 @@ export function pageSnapshot(maxChars, maxElements) {
     ...read, capturedAt: new Date().toISOString(), readyState: document.readyState,
     viewport: pageViewport(),
     headings: headings.items, links: links.items, elements: controls.elements, frames,
-    snapshotId: controls.elements[0]?.ref.split('-e')[0] || '',
+    snapshotId: controls.refContext.documentId,
+    refContext: controls.refContext,
     truncated: read.truncated || controls.truncated || headings.truncated || links.truncated,
-    scope: 'Current rendered main document. Virtualized content and cross-origin iframe DOM are not included.',
+    scope: 'Current rendered main-document region (see region). Virtualized content and cross-origin iframe DOM are not included.',
   }
 }
 

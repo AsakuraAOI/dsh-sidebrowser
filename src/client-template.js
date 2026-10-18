@@ -220,8 +220,9 @@ window.__ModuleLoader__.load({
      * @param maxChars - character budget.
      * @returns URL, title, text, and whether the text was cut.
      */
-    function pageReadText(maxChars) {
-      const text = document.body ? document.body.innerText || '' : ''
+    function pageReadText(maxChars, options = {}) {
+      const { root, region } = pageReadRoot(options, true)
+      const text = root ? root.innerText ?? root.textContent ?? '' : ''
       const normalized = text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
       const truncated = normalized.length > maxChars
       return {
@@ -229,6 +230,7 @@ window.__ModuleLoader__.load({
         title: document.title || '',
         text: truncated ? normalized.slice(0, maxChars) : normalized,
         truncated,
+        region,
       }
     }
 
@@ -237,14 +239,16 @@ window.__ModuleLoader__.load({
      * @param maxChars - character budget.
      * @returns URL, title, html, and whether the html was cut.
      */
-    function pageReadHtml(maxChars) {
-      const html = document.documentElement ? document.documentElement.outerHTML : ''
+    function pageReadHtml(maxChars, options = {}) {
+      const { root, region } = pageReadRoot(options)
+      const html = root ? root.outerHTML : ''
       const truncated = html.length > maxChars
       return {
         url: location.href,
         title: document.title || '',
         html: truncated ? html.slice(0, maxChars) : html,
         truncated,
+        region,
       }
     }
 
@@ -267,8 +271,7 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Collect visible interactive elements, register each under a fresh `eN` ref,
-     * and return their descriptors.
+     * Collect scoped interactive elements with stable document-bound refs.
      *
      * `truncated` means the element CAP was reached — the list is incomplete and
      * reading again will not help. It deliberately does not count the matches
@@ -278,24 +281,22 @@ window.__ModuleLoader__.load({
      * @param max - element budget.
      * @returns element descriptors with the refs `act` accepts.
      */
-    function pageReadElements(max) {
-      const store = new Map()
-      const generation = Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
-      window.__dshSidebrowserRefs = store
-
+    function pageReadElements(max, options = {}) {
+      const state = pageRefState(true), { root, region, focus } = pageReadRoot(options)
+      for (const [ref, el] of state.refs) if (!el.isConnected || el.ownerDocument !== document) { state.refs.delete(ref); state.signatures.delete(ref) }
       const out = []
       let cut = false
-      const nodes = document.querySelectorAll(
-        'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[contenteditable="true"]',
-      )
+      const selector = 'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[contenteditable="true"]'
+      let nodes = pageScopedNodes(root, selector)
+      if (options.afterAction) nodes = [...new Set([...(focus?.matches(selector) && root.contains(focus) ? [focus] : []),
+        ...nodes.filter(el => el.localName !== 'a' && el.getAttribute('role') !== 'link'), ...nodes])]
       for (const el of nodes) {
         if (!pageVisible(el)) continue
         if (out.length >= max) {
           cut = true
           break
         }
-        const ref = generation + '-e' + (out.length + 1)
-        store.set(ref, el)
+        const ref = pageRememberElement(el)
         const tag = el.tagName.toLowerCase()
         const type = tag === 'input' ? el.getAttribute('type') || 'text' : ''
         const secret = pageCredentialElement(el)
@@ -315,6 +316,8 @@ window.__ModuleLoader__.load({
         title: document.title || '',
         elements: out,
         truncated: cut,
+        region,
+        refContext: { documentId: state.id, capacity: state.capacity, policy: 'stable while connected, same URL/document and target semantics; bounded LRU eviction' },
       }
     }
 
@@ -569,6 +572,7 @@ window.__ModuleLoader__.load({
      */
     const PAGE_HELPERS = [
       pageClip, pageBoundInt, pageSensitiveName, pageCredentialElement, pageRedactURL,
+      pageRefState, pageElementSignature, pageRememberElement, pageReadRoot, pageScopedNodes,
       pageElementDisabled, pageElementIdentity, pageElementRect, pageElementDimensions,
       pageViewport, pageElementGeometry, pageTargetPoint, pageHitTest, pageRendererBox, pageReadResponseText,
       pageResolve,
@@ -601,9 +605,10 @@ window.__ModuleLoader__.load({
      * @param args - JSON-serializable arguments.
      * @returns source for `webview.executeJavaScript`.
      */
-    function pageCall(helper, args) {
+    function pageCall(helper, args, errorToken) {
       const prelude = PAGE_HELPERS.map((fn) => fn.toString()).join('\n')
       const invocation = `(${helper.name})(${args.map((value) => JSON.stringify(value ?? null)).join(',')})`
+      if (errorToken) return `(() => {\n${prelude}\nconst fail = error => ({ dshPageError: ${JSON.stringify(errorToken)}, message: String(error?.message || error).slice(0, 4000) });\ntry { return Promise.resolve(${invocation}).catch(fail) } catch (error) { return fail(error) }\n})()`
       return `(() => {\n${prelude}\nreturn ${invocation}\n})()`
     }
 
@@ -621,7 +626,8 @@ window.__ModuleLoader__.load({
 
     /** Human-readable reason for each refusal the page helpers report. */
     const REFUSAL_REASONS = {
-      'unknown-ref': 'that ref is not from the latest browser_read; read the elements again.',
+      'unknown-ref': 'that ref is unknown, expired after navigation, or evicted; read the target region again.',
+      'changed-ref': 'the referenced element changed identity or action semantics; observe it again before acting.',
       'stale-ref': 'the element was replaced since the last read; read the elements again.',
       'no-match': 'no element matched that selector.',
       'ambiguous-selector': 'multiple elements match; use a fresh ref or a more precise selector.',
@@ -1476,11 +1482,19 @@ window.__ModuleLoader__.load({
        */
       async run(guest, helper, args = [], budgetMs = BUDGETS.call) {
         try {
-          return await raceBudget(
-            guest.executeJavaScript(pageCall(helper, args), true),
+          if (budgetMs <= 0) {
+            const error = new Error('The page-script budget expired before dispatch; this script was not started.')
+            error.budgetExceeded = true; error.notDispatched = true
+            throw error
+          }
+          const errorToken = Date.now().toString(36) + Math.random().toString(36).slice(2)
+          const result = await raceBudget(
+            guest.executeJavaScript(pageCall(helper, args, errorToken), true),
             budgetMs,
             'the page script',
           )
+          if (result?.dshPageError === errorToken) throw new Error(result.message)
+          return result
         } catch (error) {
           // A budget overrun is not the page refusing anything; say so directly
           // instead of prefixing it with a claim about the page.
@@ -1685,7 +1699,7 @@ window.__ModuleLoader__.load({
 
         const loading = this.isLoading(guest)
         if (mode === 'elements') {
-          const result = await this.run(guest, pageReadElements, [MAX_ELEMENTS], budgetLeft(deadline))
+          const result = await this.run(guest, pageReadElements, [pageBoundInt(input.maxElements, MAX_ELEMENTS, MAX_ELEMENTS), input], budgetLeft(deadline))
           return prune({
             tabId,
             url: result.url,
@@ -1694,10 +1708,12 @@ window.__ModuleLoader__.load({
             failed: isErrorPage(result.url),
             elements: result.elements,
             truncated: result.truncated,
+            region: result.region,
+            refContext: result.refContext,
           })
         }
         if (mode === 'html') {
-          const result = await this.run(guest, pageReadHtml, [maxChars], budgetLeft(deadline))
+          const result = await this.run(guest, pageReadHtml, [maxChars, input], budgetLeft(deadline))
           return prune({
             tabId,
             url: result.url,
@@ -1706,9 +1722,10 @@ window.__ModuleLoader__.load({
             failed: isErrorPage(result.url),
             html: result.html,
             truncated: result.truncated,
+            region: result.region,
           })
         }
-        const result = await this.run(guest, pageReadText, [maxChars], budgetLeft(deadline))
+        const result = await this.run(guest, pageReadText, [maxChars, input], budgetLeft(deadline))
         return prune({
           tabId,
           url: result.url,
@@ -1717,6 +1734,7 @@ window.__ModuleLoader__.load({
           failed: isErrorPage(result.url),
           text: result.text,
           truncated: result.truncated,
+          region: result.region,
         })
       }
 
@@ -2265,12 +2283,18 @@ window.__ModuleLoader__.load({
       async evaluate(sessionId, input) {
         const code = input.code
         if (typeof code !== 'string' || code.trim() === '') throw new Error('browser_eval needs code')
-        const deadline = beginCall()
+        const scriptBudgetMs = pageBoundInt(input.timeoutMs, BUDGETS.call, 30000, 1000)
+        const deadline = beginCall(scriptBudgetMs)
         const { tabId, guest, carrier } = this.resolve(sessionId, input.tabId)
         this.requireDrivable(carrier, 'run script')
         await this.settle(guest, budgetLeft(deadline))
-        const result = await this.run(guest, pageEval, [code], budgetLeft(deadline))
-        return prune({ tabId, ...result, ...(await this.describe(guest, budgetLeft(deadline))) })
+        let result
+        try { result = await this.run(guest, pageEval, [code], budgetLeft(deadline)) }
+        catch (error) {
+          if (error?.budgetExceeded && !error.notDispatched) error.message += ' The script and network requests may still be running; writes may already have happened. Observe business state before retrying. Use one async request with its own AbortController deadline instead of synchronous XHR or a request batch.'
+          throw error
+        }
+        return prune({ tabId, ...result, scriptBudgetMs, ...(await this.describe(guest, budgetLeft(deadline))) })
       }
     }
 
@@ -2653,6 +2677,9 @@ window.__ModuleLoader__.load({
                   tabId: TAB_ID,
                   mode: { type: 'string', enum: ['text', 'elements', 'html'], description: 'What to return.' },
                   maxChars: { type: 'number', description: 'Character budget for text and html modes.' },
+                  maxElements: { type: 'number' },
+                  selector: { type: 'string' },
+                  ref: { type: 'string' },
                 },
                 additionalProperties: false,
               },
@@ -2736,6 +2763,7 @@ window.__ModuleLoader__.load({
                 type: 'object',
                 properties: {
                   code: { type: 'string', description: 'Expression or statements to evaluate in the page.' },
+                  timeoutMs: { type: 'number' },
                   tabId: TAB_ID,
                 },
                 required: ['code'],

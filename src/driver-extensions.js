@@ -9,7 +9,7 @@ BrowserDriver.prototype.snapshot = async function (sessionId, input) {
   const { tabId, guest, carrier } = this.resolve(sessionId, input.tabId)
   this.requireDrivable(carrier, 'be observed')
   await this.settle(guest, budgetLeft(deadline))
-  const result = await this.run(guest, pageSnapshot, [input.maxChars, input.maxElements], budgetLeft(deadline))
+  const result = await this.run(guest, pageSnapshot, [input.maxChars, input.maxElements, input], budgetLeft(deadline))
   return prune({ tabId, ...result, loading: this.isLoading(guest), failed: isErrorPage(result.url),
     capabilities: { nativeInput: typeof guest.sendInputEvent === 'function', nativeText: typeof guest.insertText === 'function',
       mainDocument: true, crossOriginFrameDOM: false, networkCapture: 'opt-in-document-probes', diagnostics: 'browser_dev_*', nativeCDP: false } })
@@ -140,7 +140,7 @@ function buildProvider(ctx, viewport) {
   provider.manifest.methods.push(
     ...DEBUG_TOOLS.map(([_name, name, description, properties]) => ({ name, description,
       inputSchema: { type: 'object', properties, additionalProperties: false } })),
-    { name: 'snapshot', description: 'Read a bounded structured main-document snapshot.', inputSchema: { type: 'object', properties: { tabId: TAB, maxChars: { type: 'number' }, maxElements: { type: 'number' } }, additionalProperties: false } },
+    { name: 'snapshot', description: 'Read a bounded structured main-document region with stable refs.', inputSchema: { type: 'object', properties: { tabId: TAB, maxChars: { type: 'number' }, maxElements: { type: 'number' }, selector: { type: 'string' }, ref: { type: 'string' }, afterAction: { type: 'boolean' }, focusRef: { type: 'string' }, focusSelector: { type: 'string' } }, additionalProperties: false } },
     { name: 'extract', description: 'Extract rendered table rows, links, headings or list items.', inputSchema: { type: 'object', properties: { tabId: TAB, kind: { type: 'string', enum: ['links','headings','tables','list'] }, selector: { type: 'string' }, limit: { type: 'number' }, maxChars: { type: 'number' } }, required: ['kind'], additionalProperties: false } },
   )
   const action = provider.manifest.methods.find(method => method.name === 'act')

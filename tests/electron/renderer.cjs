@@ -31,6 +31,7 @@ view.addEventListener('did-finish-load', async () => {
     assert.equal(first.capabilities.nativeInput, true)
     const debugAcceptance = await require('./debug.cjs')(call, view, provider)
     debugAcceptance.pageDiagnostics = await require('./diagnostics.cjs')(call, view)
+    debugAcceptance.refRegression = await require('./refs.cjs')(call, view)
     const type = await call('act', { action: 'type', selector: '#name', text: 'Mira', inputMode: 'native' })
     assert.equal(type.backend, 'native')
     await call('act', { action: 'type', selector: '#name', text: '', inputMode: 'native' })

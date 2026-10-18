@@ -31,9 +31,11 @@ try {
   }
   const samples = [
     ['browser_tabs', {}], ['browser_read', {}], ['browser_read', { mode: 'elements' }],
+    ['browser_read', { mode: 'elements', selector: '#name', maxElements: 1 }], ['browser_read', { mode: 'html', selector: '#name' }],
+    ['browser_snapshot', { selector: 'body', maxElements: 1 }],
     ['browser_snapshot', {}], ['browser_extract', { kind: 'tables' }],
     ['browser_act', { action: 'type', selector: '#name', text: '', inputMode: 'dom' }],
-    ['browser_eval', { code: 'Promise.resolve({answer:42})' }],
+    ['browser_eval', { code: 'Promise.resolve({answer:42})', timeoutMs: 1000 }],
     ['browser_dev_debug', { action: 'start' }], ['browser_dev_console', {}], ['browser_dev_network', {}],
     ['browser_dev_debug', { action: 'stop' }],
     ['browser_dev_inspect', { selector: '#name' }], ['browser_dev_styles', { selector: '#name' }],

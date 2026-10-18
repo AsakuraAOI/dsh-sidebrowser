@@ -2,7 +2,7 @@
 
 让 Agent 直接读取和操作 **DSH Desktop 官方侧边栏的同一个网页**。以 web-access 的观察、操作、验证流程为指导，基于 dsh-agent-browser 的侧边栏接入代码开发。无需外部 Chrome、扩展、后台代理或桌面安装包补丁。
 
-包名：`dsh-sidebrowser`，版本：`0.4.1`。普通工具使用 `browser_*`，开发诊断工具统一使用 `browser_dev_*`。旧的三个调试工具名已移除。
+包名：`dsh-sidebrowser`，版本：`0.4.2`。普通工具使用 `browser_*`，开发诊断工具统一使用 `browser_dev_*`。旧的三个调试工具名已移除。
 
 ## 安装
 
@@ -95,9 +95,21 @@ dsh plugin --profile desktop add 'github:AsakuraAOI/dsh-sidebrowser'
 - auto 为默认：点击和按键优先使用 `sendInputEvent`，文本输入使用 `insertText` 和原生编辑命令；缺少能力或页面尚未绘制时明确返回 DOM 后端及回退原因。
 - native 为严格模式，不会偷偷换成脚本点击；dom 为明确选择脚本后端。坐标点击仅支持 native。
 - 原生鼠标/按键前进行有界的本地绘制检查；画面未就绪时不盲发事件。检查用的图片不发送给模型。
-- 默认为每次动作附加一次新的 `observation`；读取失败会保留动作结果并附 `observationError`，不会重放写操作。
+- 每次动作默认附加一次新的 `observation`，优先观察操作目标所在表单、对话框或主体区域；必要时优先列出目标和输入/按钮，避免菜单链接占满控件预算。`region` 说明观察范围。读取失败保留动作结果并附 `observationError`，不会重放写操作。
 - `actionDispatched` 代表已派发；`verificationRequired` 提醒仍需核对页面/业务结果。不会把页面加载完毕当作任务完成。
-- 新 snapshot 或 elements 读取会更换全部 ref；过期 ref、歧义选择器、遮挡或禁用控件会明确拒绝。输入结果不回显用户填写的文本。
+- 同一文档、URL 和未变目标的 ref 在重复读取、局部读取、截断及自动观察后保持有效，不再每次重建全部引用。节点断开/替换、关键身份或动作属性改变、导航、文档变化及缓存淘汰仍会拒绝旧 ref，绝不按同名选择器自动改指向新节点。引用表最多保留 1000 项，`refContext` 说明容量和有效性边界。输入值变化本身不使 ref 失效，密码等值继续遮蔽。
+
+### 局部读取与脚本预算
+
+`browser_read` 的 text/html/elements 和 `browser_snapshot` 均可用唯一 `selector` 或当前 `ref` 限定区域，区域根元素本身也包含在元素读取中。例如：
+
+```json
+{"mode":"elements","selector":"form#mission","maxElements":20}
+```
+
+`maxChars` 只限制文字/HTML；元素模式使用 `maxElements`（1–300，默认 300），快照的控件上限为 1–200。只读观察不会因为输出预算较小而删除其他仍有效的 ref。默认整页读取仍可用；长页面建议先明确 form/main 等范围。
+
+`browser_eval` 默认总等待预算仍为 6 秒，可通过 `timeoutMs` 显式调整至 1–30 秒。网络脚本应使用单步异步请求及请求级 AbortController/deadline，避免同步 XHR 与长串写请求。外层工具超时不会取消底层脚本或请求；写操作结果未知时先核对状态，不重发整批。布局、日志和请求诊断优先使用 browser_dev_*，业务成功应由具体页面或响应条件验证。页面异常会保留具体原因返回，而不是仅出现 Electron 的泛化脚本错误。
 
 ### 提取范围
 

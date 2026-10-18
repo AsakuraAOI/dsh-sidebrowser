@@ -11,7 +11,7 @@ test('Host registers nineteen browser_* tools and an optional workflow skill', (
   h.dispose(); assert.equal(h.tools.size, 0)
 })
 
-test('snapshots redact credential values, include rendered structures and reject old ref generations', async () => {
+test('snapshots redact credential values, retain unchanged refs and reject replaced targets', async () => {
   const h = clientHarness('<h1>Fixture</h1><input id="name" value="Mira"><input type="password" value="private-sentinel"><input name="api_key" value="private-key"><a href="/next">Next</a>')
   try {
     const first = await h.driver.snapshot('A', {})
@@ -21,7 +21,9 @@ test('snapshots redact credential values, include rendered structures and reject
     assert.ok(!JSON.stringify(first).includes('private-key'))
     assert.ok(first.elements.some(el => el.value === 'Mira'))
     const ref = first.elements[0].ref
-    await h.driver.snapshot('A', {})
+    const second = await h.driver.snapshot('A', {})
+    assert.equal(second.elements[0].ref, ref)
+    h.guest.document.querySelector('#name').outerHTML = '<input id="name" value="replacement">'
     await assert.rejects(h.driver.act('A', { action: 'click', ref, inputMode: 'dom' }), /latest|ref|read/i)
   } finally { await h.close() }
 })

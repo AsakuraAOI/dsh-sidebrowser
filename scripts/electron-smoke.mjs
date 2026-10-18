@@ -20,7 +20,7 @@ const locales = path.join(output, 'locales')
 if (!fs.existsSync(locales)) fs.symlinkSync(path.join(install, 'locales'), locales, 'junction')
 const app = path.join(output, 'resources', 'app')
 fs.writeFileSync(path.join(app, 'package.json'), JSON.stringify({ name: 'dsh-sidebrowser-fixture', version: '0.0.0', main: 'main.cjs' }))
-for (const name of ['main.cjs', 'renderer.cjs', 'debug.cjs', 'diagnostics.cjs', 'index.html']) fs.copyFileSync(path.join(root, 'tests', 'electron', name), path.join(app, name))
+for (const name of ['main.cjs', 'renderer.cjs', 'debug.cjs', 'diagnostics.cjs', 'refs.cjs', 'index.html']) fs.copyFileSync(path.join(root, 'tests', 'electron', name), path.join(app, name))
 const env = { ...process.env, DSH_SIDEBROWSER_PLUGIN_ROOT: root, DSH_SIDEBROWSER_REPORT: path.join(output, 'result.json') }
 delete env.ELECTRON_RUN_AS_NODE
 const child = spawn(path.join(output, 'BrowserFixture.exe'), [], { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })

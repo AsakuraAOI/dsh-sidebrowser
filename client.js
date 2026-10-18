@@ -227,12 +227,75 @@ function pageRedactURL(value, base, stripHash = false) {
   return url.href
 }
 
+function pageRefState(create = false) {
+  let state = window.__dshSidebrowserRefState
+  if (state && (state.document !== document || state.root !== document.documentElement || state.url !== location.href)) {
+    state.refs.clear(); state.signatures.clear()
+    delete window.__dshSidebrowserRefState; delete window.__dshSidebrowserRefs
+    state = undefined
+  }
+  if (!state && create) {
+    state = { document, root: document.documentElement, url: location.href,
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 10), next: 0,
+      refs: new Map(), ids: new WeakMap(), signatures: new Map(), capacity: 1000 }
+    window.__dshSidebrowserRefState = state
+    window.__dshSidebrowserRefs = state.refs
+  }
+  return state
+}
+
+function pageElementSignature(el) {
+  return JSON.stringify([el.localName, ...['id','name','type','role','href','formaction','formmethod','aria-label'].map(name => el.getAttribute(name)),
+    el.form?.getAttribute('action') || '', el.form?.getAttribute('method') || '',
+    el.matches('button,a,[role=button],[role=link]') ? pageClip(el.textContent?.trim(), 200) : '',
+    el.localName === 'input' && ['submit','button','reset'].includes(el.type) ? el.getAttribute('value') : ''])
+}
+
+function pageRememberElement(el) {
+  const state = pageRefState(true), signature = pageElementSignature(el)
+  let ref = state.ids.get(el)
+  if (!ref || !state.refs.has(ref) || state.signatures.get(ref) !== signature) {
+    if (ref) { state.refs.delete(ref); state.signatures.delete(ref) }
+    ref = state.id + '-e' + ++state.next
+    state.ids.set(el, ref)
+  } else state.refs.delete(ref) // LRU: observations keep actively used targets.
+  state.refs.set(ref, el); state.signatures.set(ref, signature)
+  while (state.refs.size > state.capacity) { const old = state.refs.keys().next().value; state.refs.delete(old); state.signatures.delete(old) }
+  return ref
+}
+
+function pageReadRoot(options = {}, preferBody = false) {
+  if (options.root?.nodeType === 1 && options.root.ownerDocument === document) return { root: options.root, region: options.region, focus: options.focus }
+  if (options.selector || options.ref) {
+    const found = pageResolve(options.ref, options.selector)
+    if (!found.el) throw new Error(`Read scope unavailable: ${found.reason}`)
+    return { root: found.el, focus: found.el, region: { kind: options.selector ? 'selector' : 'ref', target: pageElementIdentity(found.el) } }
+  }
+  if (options.afterAction) {
+    const found = options.focusRef || options.focusSelector ? pageResolve(options.focusRef, options.focusSelector) : {}
+    const active = document.activeElement
+    const candidate = found.el || (active && !['body','html'].includes(active.localName) ? active : null)
+    const focus = candidate && pageVisible(candidate) ? candidate : null
+    const main = document.querySelectorAll('main,[role="main"]')
+    const root = focus?.closest('form') || focus?.closest('dialog,[role="dialog"]') || focus?.closest('main,[role="main"],section,article')
+      || (main.length === 1 ? main[0] : document.body || document.documentElement)
+    return { root, focus, region: { kind: 'after-action', target: pageElementIdentity(root), priorityTarget: pageElementIdentity(focus) } }
+  }
+  const root = preferBody ? document.body || document.documentElement : document.documentElement
+  return { root, region: { kind: 'document', target: pageElementIdentity(root) } }
+}
+
+function pageScopedNodes(root, selector) {
+  return [...(root.matches(selector) ? [root] : []), ...root.querySelectorAll(selector)]
+}
+
 function pageResolve(ref, selector, unique = true) {
   if (ref) {
-    const store = window.__dshSidebrowserRefs
-    const el = store && store.get ? store.get(ref) : undefined
+    const state = pageRefState(), el = state?.refs.get(ref)
     if (!el) return { reason: 'unknown-ref' }
-    if (!el.isConnected) return { reason: 'stale-ref' }
+    if (!el.isConnected || el.ownerDocument !== document) return { reason: 'stale-ref' }
+    if (state.signatures.get(ref) !== pageElementSignature(el)) return { reason: 'changed-ref' }
+    state.refs.delete(ref); state.refs.set(ref, el)
     return { el }
   }
   if (selector) {
@@ -347,8 +410,9 @@ async function pageReadResponseText(response, options = {}) {
      * @param maxChars - character budget.
      * @returns URL, title, text, and whether the text was cut.
      */
-    function pageReadText(maxChars) {
-      const text = document.body ? document.body.innerText || '' : ''
+    function pageReadText(maxChars, options = {}) {
+      const { root, region } = pageReadRoot(options, true)
+      const text = root ? root.innerText ?? root.textContent ?? '' : ''
       const normalized = text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
       const truncated = normalized.length > maxChars
       return {
@@ -356,6 +420,7 @@ async function pageReadResponseText(response, options = {}) {
         title: document.title || '',
         text: truncated ? normalized.slice(0, maxChars) : normalized,
         truncated,
+        region,
       }
     }
 
@@ -364,14 +429,16 @@ async function pageReadResponseText(response, options = {}) {
      * @param maxChars - character budget.
      * @returns URL, title, html, and whether the html was cut.
      */
-    function pageReadHtml(maxChars) {
-      const html = document.documentElement ? document.documentElement.outerHTML : ''
+    function pageReadHtml(maxChars, options = {}) {
+      const { root, region } = pageReadRoot(options)
+      const html = root ? root.outerHTML : ''
       const truncated = html.length > maxChars
       return {
         url: location.href,
         title: document.title || '',
         html: truncated ? html.slice(0, maxChars) : html,
         truncated,
+        region,
       }
     }
 
@@ -394,8 +461,7 @@ async function pageReadResponseText(response, options = {}) {
     }
 
     /**
-     * Collect visible interactive elements, register each under a fresh `eN` ref,
-     * and return their descriptors.
+     * Collect scoped interactive elements with stable document-bound refs.
      *
      * `truncated` means the element CAP was reached — the list is incomplete and
      * reading again will not help. It deliberately does not count the matches
@@ -405,24 +471,22 @@ async function pageReadResponseText(response, options = {}) {
      * @param max - element budget.
      * @returns element descriptors with the refs `act` accepts.
      */
-    function pageReadElements(max) {
-      const store = new Map()
-      const generation = Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
-      window.__dshSidebrowserRefs = store
-
+    function pageReadElements(max, options = {}) {
+      const state = pageRefState(true), { root, region, focus } = pageReadRoot(options)
+      for (const [ref, el] of state.refs) if (!el.isConnected || el.ownerDocument !== document) { state.refs.delete(ref); state.signatures.delete(ref) }
       const out = []
       let cut = false
-      const nodes = document.querySelectorAll(
-        'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[contenteditable="true"]',
-      )
+      const selector = 'a[href],button,input,select,textarea,summary,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[contenteditable="true"]'
+      let nodes = pageScopedNodes(root, selector)
+      if (options.afterAction) nodes = [...new Set([...(focus?.matches(selector) && root.contains(focus) ? [focus] : []),
+        ...nodes.filter(el => el.localName !== 'a' && el.getAttribute('role') !== 'link'), ...nodes])]
       for (const el of nodes) {
         if (!pageVisible(el)) continue
         if (out.length >= max) {
           cut = true
           break
         }
-        const ref = generation + '-e' + (out.length + 1)
-        store.set(ref, el)
+        const ref = pageRememberElement(el)
         const tag = el.tagName.toLowerCase()
         const type = tag === 'input' ? el.getAttribute('type') || 'text' : ''
         const secret = pageCredentialElement(el)
@@ -442,6 +506,8 @@ async function pageReadResponseText(response, options = {}) {
         title: document.title || '',
         elements: out,
         truncated: cut,
+        region,
+        refContext: { documentId: state.id, capacity: state.capacity, policy: 'stable while connected, same URL/document and target semantics; bounded LRU eviction' },
       }
     }
 
@@ -696,6 +762,7 @@ async function pageReadResponseText(response, options = {}) {
      */
     const PAGE_HELPERS = [
       pageClip, pageBoundInt, pageSensitiveName, pageCredentialElement, pageRedactURL,
+      pageRefState, pageElementSignature, pageRememberElement, pageReadRoot, pageScopedNodes,
       pageElementDisabled, pageElementIdentity, pageElementRect, pageElementDimensions,
       pageViewport, pageElementGeometry, pageTargetPoint, pageHitTest, pageRendererBox, pageReadResponseText,
       pageResolve,
@@ -728,9 +795,10 @@ async function pageReadResponseText(response, options = {}) {
      * @param args - JSON-serializable arguments.
      * @returns source for `webview.executeJavaScript`.
      */
-    function pageCall(helper, args) {
+    function pageCall(helper, args, errorToken) {
       const prelude = PAGE_HELPERS.map((fn) => fn.toString()).join('\n')
       const invocation = `(${helper.name})(${args.map((value) => JSON.stringify(value ?? null)).join(',')})`
+      if (errorToken) return `(() => {\n${prelude}\nconst fail = error => ({ dshPageError: ${JSON.stringify(errorToken)}, message: String(error?.message || error).slice(0, 4000) });\ntry { return Promise.resolve(${invocation}).catch(fail) } catch (error) { return fail(error) }\n})()`
       return `(() => {\n${prelude}\nreturn ${invocation}\n})()`
     }
 
@@ -748,7 +816,8 @@ async function pageReadResponseText(response, options = {}) {
 
     /** Human-readable reason for each refusal the page helpers report. */
     const REFUSAL_REASONS = {
-      'unknown-ref': 'that ref is not from the latest browser_read; read the elements again.',
+      'unknown-ref': 'that ref is unknown, expired after navigation, or evicted; read the target region again.',
+      'changed-ref': 'the referenced element changed identity or action semantics; observe it again before acting.',
       'stale-ref': 'the element was replaced since the last read; read the elements again.',
       'no-match': 'no element matched that selector.',
       'ambiguous-selector': 'multiple elements match; use a fresh ref or a more precise selector.',
@@ -762,7 +831,7 @@ async function pageReadResponseText(response, options = {}) {
     // Fixed page-side readers. These functions are embedded into the Client bundle
 // by scripts/build.mjs; they run in the selected guest, never in the DSH host.
 
-function pageExtract(kind, selector, limit, maxChars) {
+function pageExtract(kind, selector, limit, maxChars, options = {}) {
   const result = { url: location.href, title: document.title || '', kind, items: [], truncated: false }
   let remaining = Math.max(128, Math.min(50000, maxChars || 10000))
   const count = Math.max(1, Math.min(kind === 'tables' ? 10 : 200, Math.floor(limit || 50)))
@@ -777,7 +846,7 @@ function pageExtract(kind, selector, limit, maxChars) {
   const defaults = { links: 'a[href]', headings: 'h1,h2,h3,h4,h5,h6', tables: 'table', list: 'li' }
   if (!defaults[kind]) throw new Error('Unsupported extraction kind')
   let nodes
-  try { nodes = document.querySelectorAll(selector || defaults[kind]) }
+  try { nodes = pageScopedNodes(pageReadRoot(options).root, selector || defaults[kind]) }
   catch { throw new Error('Invalid extraction selector') }
   for (const el of nodes) {
     if (!pageVisible(el)) continue
@@ -805,12 +874,13 @@ function pageExtract(kind, selector, limit, maxChars) {
   return result
 }
 
-function pageSnapshot(maxChars, maxElements) {
-  const read = pageReadText(Math.max(128, Math.min(30000, maxChars || 8000)))
-  const controls = pageReadElements(Math.max(1, Math.min(200, maxElements || 80)))
-  const headings = pageExtract('headings', '', 40, 2000)
-  const links = pageExtract('links', '', 40, 4000)
-  const frames = [...document.querySelectorAll('iframe,frame')].slice(0, 30).map((el, index) => {
+function pageSnapshot(maxChars, maxElements, options = {}) {
+  const scope = { ...options, ...pageReadRoot(options, true) }
+  const read = pageReadText(Math.max(128, Math.min(30000, maxChars || 8000)), scope)
+  const controls = pageReadElements(Math.max(1, Math.min(200, maxElements || 80)), scope)
+  const headings = pageExtract('headings', '', 40, 2000, scope)
+  const links = pageExtract('links', '', 40, 4000, scope)
+  const frames = pageScopedNodes(scope.root, 'iframe,frame').slice(0, 30).map((el, index) => {
     let readable = false
     try { readable = !!el.contentDocument?.documentElement } catch {}
     return { index, title: (el.getAttribute('title') || '').slice(0, 200), src: (el.getAttribute('src') || '').slice(0, 2000), readable }
@@ -819,9 +889,10 @@ function pageSnapshot(maxChars, maxElements) {
     ...read, capturedAt: new Date().toISOString(), readyState: document.readyState,
     viewport: pageViewport(),
     headings: headings.items, links: links.items, elements: controls.elements, frames,
-    snapshotId: controls.elements[0]?.ref.split('-e')[0] || '',
+    snapshotId: controls.refContext.documentId,
+    refContext: controls.refContext,
     truncated: read.truncated || controls.truncated || headings.truncated || links.truncated,
-    scope: 'Current rendered main document. Virtualized content and cross-origin iframe DOM are not included.',
+    scope: 'Current rendered main-document region (see region). Virtualized content and cross-origin iframe DOM are not included.',
   }
 }
 
@@ -1711,11 +1782,19 @@ function pageVisualTarget(ref, selector) {
        */
       async run(guest, helper, args = [], budgetMs = BUDGETS.call) {
         try {
-          return await raceBudget(
-            guest.executeJavaScript(pageCall(helper, args), true),
+          if (budgetMs <= 0) {
+            const error = new Error('The page-script budget expired before dispatch; this script was not started.')
+            error.budgetExceeded = true; error.notDispatched = true
+            throw error
+          }
+          const errorToken = Date.now().toString(36) + Math.random().toString(36).slice(2)
+          const result = await raceBudget(
+            guest.executeJavaScript(pageCall(helper, args, errorToken), true),
             budgetMs,
             'the page script',
           )
+          if (result?.dshPageError === errorToken) throw new Error(result.message)
+          return result
         } catch (error) {
           // A budget overrun is not the page refusing anything; say so directly
           // instead of prefixing it with a claim about the page.
@@ -1920,7 +1999,7 @@ function pageVisualTarget(ref, selector) {
 
         const loading = this.isLoading(guest)
         if (mode === 'elements') {
-          const result = await this.run(guest, pageReadElements, [MAX_ELEMENTS], budgetLeft(deadline))
+          const result = await this.run(guest, pageReadElements, [pageBoundInt(input.maxElements, MAX_ELEMENTS, MAX_ELEMENTS), input], budgetLeft(deadline))
           return prune({
             tabId,
             url: result.url,
@@ -1929,10 +2008,12 @@ function pageVisualTarget(ref, selector) {
             failed: isErrorPage(result.url),
             elements: result.elements,
             truncated: result.truncated,
+            region: result.region,
+            refContext: result.refContext,
           })
         }
         if (mode === 'html') {
-          const result = await this.run(guest, pageReadHtml, [maxChars], budgetLeft(deadline))
+          const result = await this.run(guest, pageReadHtml, [maxChars, input], budgetLeft(deadline))
           return prune({
             tabId,
             url: result.url,
@@ -1941,9 +2022,10 @@ function pageVisualTarget(ref, selector) {
             failed: isErrorPage(result.url),
             html: result.html,
             truncated: result.truncated,
+            region: result.region,
           })
         }
-        const result = await this.run(guest, pageReadText, [maxChars], budgetLeft(deadline))
+        const result = await this.run(guest, pageReadText, [maxChars, input], budgetLeft(deadline))
         return prune({
           tabId,
           url: result.url,
@@ -1952,6 +2034,7 @@ function pageVisualTarget(ref, selector) {
           failed: isErrorPage(result.url),
           text: result.text,
           truncated: result.truncated,
+          region: result.region,
         })
       }
 
@@ -2500,12 +2583,18 @@ function pageVisualTarget(ref, selector) {
       async evaluate(sessionId, input) {
         const code = input.code
         if (typeof code !== 'string' || code.trim() === '') throw new Error('browser_eval needs code')
-        const deadline = beginCall()
+        const scriptBudgetMs = pageBoundInt(input.timeoutMs, BUDGETS.call, 30000, 1000)
+        const deadline = beginCall(scriptBudgetMs)
         const { tabId, guest, carrier } = this.resolve(sessionId, input.tabId)
         this.requireDrivable(carrier, 'run script')
         await this.settle(guest, budgetLeft(deadline))
-        const result = await this.run(guest, pageEval, [code], budgetLeft(deadline))
-        return prune({ tabId, ...result, ...(await this.describe(guest, budgetLeft(deadline))) })
+        let result
+        try { result = await this.run(guest, pageEval, [code], budgetLeft(deadline)) }
+        catch (error) {
+          if (error?.budgetExceeded && !error.notDispatched) error.message += ' The script and network requests may still be running; writes may already have happened. Observe business state before retrying. Use one async request with its own AbortController deadline instead of synchronous XHR or a request batch.'
+          throw error
+        }
+        return prune({ tabId, ...result, scriptBudgetMs, ...(await this.describe(guest, budgetLeft(deadline))) })
       }
     }
 
@@ -3770,7 +3859,7 @@ BrowserDriver.prototype.snapshot = async function (sessionId, input) {
   const { tabId, guest, carrier } = this.resolve(sessionId, input.tabId)
   this.requireDrivable(carrier, 'be observed')
   await this.settle(guest, budgetLeft(deadline))
-  const result = await this.run(guest, pageSnapshot, [input.maxChars, input.maxElements], budgetLeft(deadline))
+  const result = await this.run(guest, pageSnapshot, [input.maxChars, input.maxElements, input], budgetLeft(deadline))
   return prune({ tabId, ...result, loading: this.isLoading(guest), failed: isErrorPage(result.url),
     capabilities: { nativeInput: typeof guest.sendInputEvent === 'function', nativeText: typeof guest.insertText === 'function',
       mainDocument: true, crossOriginFrameDOM: false, networkCapture: 'opt-in-document-probes', diagnostics: 'browser_dev_*', nativeCDP: false } })
@@ -3901,7 +3990,7 @@ function buildProvider(ctx, viewport) {
   provider.manifest.methods.push(
     ...DEBUG_TOOLS.map(([_name, name, description, properties]) => ({ name, description,
       inputSchema: { type: 'object', properties, additionalProperties: false } })),
-    { name: 'snapshot', description: 'Read a bounded structured main-document snapshot.', inputSchema: { type: 'object', properties: { tabId: TAB, maxChars: { type: 'number' }, maxElements: { type: 'number' } }, additionalProperties: false } },
+    { name: 'snapshot', description: 'Read a bounded structured main-document region with stable refs.', inputSchema: { type: 'object', properties: { tabId: TAB, maxChars: { type: 'number' }, maxElements: { type: 'number' }, selector: { type: 'string' }, ref: { type: 'string' }, afterAction: { type: 'boolean' }, focusRef: { type: 'string' }, focusSelector: { type: 'string' } }, additionalProperties: false } },
     { name: 'extract', description: 'Extract rendered table rows, links, headings or list items.', inputSchema: { type: 'object', properties: { tabId: TAB, kind: { type: 'string', enum: ['links','headings','tables','list'] }, selector: { type: 'string' }, limit: { type: 'number' }, maxChars: { type: 'number' } }, required: ['kind'], additionalProperties: false } },
   )
   const action = provider.manifest.methods.find(method => method.name === 'act')
@@ -4314,6 +4403,9 @@ function buildProvider(ctx, viewport) {
                   tabId: TAB_ID,
                   mode: { type: 'string', enum: ['text', 'elements', 'html'], description: 'What to return.' },
                   maxChars: { type: 'number', description: 'Character budget for text and html modes.' },
+                  maxElements: { type: 'number' },
+                  selector: { type: 'string' },
+                  ref: { type: 'string' },
                 },
                 additionalProperties: false,
               },
@@ -4397,6 +4489,7 @@ function buildProvider(ctx, viewport) {
                 type: 'object',
                 properties: {
                   code: { type: 'string', description: 'Expression or statements to evaluate in the page.' },
+                  timeoutMs: { type: 'number' },
                   tabId: TAB_ID,
                 },
                 required: ['code'],

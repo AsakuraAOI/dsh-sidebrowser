@@ -1,6 +1,6 @@
 {
   "name": "dsh-sidebrowser",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "type": "module",
   "description": "DSH 官方侧边栏浏览器：结构化观察、原生输入、页面开发诊断与操作后复核。",
@@ -49,5 +49,18 @@
   "license": "MIT",
   "devDependencies": {
     "happy-dom": "^21.0.3"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AsakuraAOI/dsh-sidebrowser.git"
+  },
+  "homepage": "https://github.com/AsakuraAOI/dsh-sidebrowser#readme",
+  "bugs": {
+    "url": "https://github.com/AsakuraAOI/dsh-sidebrowser/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness"
+  ]
 }
