@@ -1,3 +1,4 @@
+import { registerPluginSettings } from "./plugin-settings.js";
 import { registerFeatures } from './src/features.js'
 // Adapted from guanhaisen/dsh-agent-browser @ 063465a77aa7c7ca1a154bd487ccd165e3f90185 (MIT). See THIRD_PARTY_NOTICES.md.
 /**
@@ -777,6 +778,7 @@ function applyReference(ctx, config) {
 
 /** Install the tools plus the optional DSH skill catalog entry. */
 function apply(ctx, config) {
+  registerPluginSettings(ctx);
   const settings = { ...DEFAULTS, ...(config || {}) }
   settings.maxReadChars = Math.max(128, Math.min(50000, Number.isFinite(settings.maxReadChars) ? settings.maxReadChars : 20000))
   settings.snapshotMaxChars = Math.max(128, Math.min(30000, Number.isFinite(settings.snapshotMaxChars) ? settings.snapshotMaxChars : 8000))

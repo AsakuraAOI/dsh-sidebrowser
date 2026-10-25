@@ -1,6 +1,6 @@
 {
   "name": "dsh-sidebrowser",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "type": "module",
   "description": "DSH 官方侧边栏浏览器：结构化观察、原生输入、页面开发诊断与操作后复核。",
@@ -19,7 +19,10 @@
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
-    "THIRD_PARTY_NOTICES.md"
+    "THIRD_PARTY_NOTICES.md",
+    "plugin-settings.js",
+    "settings-ui.js",
+    "scripts/build-settings.mjs"
   ],
   "dsh": {
     "bundle": {
@@ -31,7 +34,9 @@
       "inject": [
         "@deepseek-ai/dsh-cordis-client-runner",
         "@deepseek-ai/dsh-client-ui-sidebar-right",
-        "@deepseek-ai/dsh-api-session-controller"
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
       ]
     }
   },
@@ -44,7 +49,8 @@
   "scripts": {
     "test": "node --test tests/*.test.mjs",
     "check": "node --check index.js && node --check client.js && node --check src/features.js",
-    "build": "node scripts/build.mjs"
+    "build": "node scripts/build.mjs && npm run build:settings",
+    "build:settings": "node scripts/build-settings.mjs"
   },
   "license": "MIT",
   "devDependencies": {
@@ -62,5 +68,23 @@
     "dsh",
     "dsh-plugin",
     "deepseek-harness"
-  ]
+  ],
+  "pluginPage": {
+    "name": "dsh-sidebrowser",
+    "title": "侧边栏浏览器",
+    "route": "/api/plugins/dsh-sidebrowser/settings",
+    "titles": {
+      "kasumi-retry": "Kasumi 重试与续写",
+      "hiagent-global": "Kasumi 全局适配",
+      "hiagent-global-compaction": "全局压缩",
+      "hiagent-observability": "性能观测",
+      "hiagent-recovery": "恢复保护",
+      "hiagent-query-budget": "请求预算",
+      "bilibili-account": "B站账号与视频阅读",
+      "hiagent-web-search": "网页搜索与读取",
+      "seeit-video": "Seeit 视频理解",
+      "session-md-export": "导出选项",
+      "kasumiflow": "学习事务与课程资料"
+    }
+  }
 }
