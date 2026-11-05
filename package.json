@@ -1,6 +1,6 @@
 {
   "name": "dsh-sidebrowser",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "private": true,
   "type": "module",
   "description": "DSH 官方侧边栏浏览器：结构化观察、原生输入、页面开发诊断与操作后复核。",
@@ -41,7 +41,7 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.4"
+    "@deepseek-ai/cordis": "~4.0.4 || ~4.1.0"
   },
   "engines": {
     "node": ">=22"
